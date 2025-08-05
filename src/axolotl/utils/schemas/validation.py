@@ -2,6 +2,7 @@
 
 # pylint: disable=too-many-boolean-expressions
 
+import re
 import json
 import tempfile
 from pathlib import Path
@@ -1091,7 +1092,7 @@ class ModelCompatibilityValidationMixin:
     @model_validator(mode="after")
     def check_mpt_checkpointing(self):
         if (
-            self.base_model and "mpt" in self.base_model.lower()
+            self.base_model and re.search(r'\bmpt\b', self.base_model.lower())
         ) and self.gradient_checkpointing:
             raise ValueError("gradient_checkpointing is not supported for MPT models")
         return self
