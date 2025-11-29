@@ -352,24 +352,41 @@ def apply_lora_kernel_patches(
         LOG.warning("Please specify `lora_dropout: 0` in your axolotl config file")
         return model
 
+    # Check if this is a MoE model - if so, skip MLP kernel patches entirely
+    # MoE models have conditional expert execution which is incompatible with
+    # synchronized DTensor unsharding in the LoRA kernels
+    text_config = (
+        model.config.get_text_config()
+        if hasattr(model.config, "get_text_config")
+        else model.config
+    )
+    is_moe_model = (
+        hasattr(text_config, "num_experts")
+        or hasattr(text_config, "num_local_experts")
+        or "moe" in getattr(text_config, "model_type", "").lower()
+    )
+
+    if is_moe_model and cfg.lora_mlp_kernel:
+        LOG.warning(
+            "Detected MoE model - disabling LoRA MLP kernel optimizations.  "
+            "MoE expert routing causes non-deterministic execution paths that are "
+            "incompatible with synchronized DTensor unsharding in FSDP2."
+        )
+        cfg.lora_mlp_kernel = False
+
     # This needs to be reset after patching
     original_level = LOG.getEffectiveLevel()
     LOG.setLevel(logging.INFO)
 
     # Choose activation based on model type
     activation = None
-    text_config = (
-        model.config.get_text_config()
-        if hasattr(model.config, "get_text_config")
-        else model.config
-    )
     if hasattr(text_config, "hidden_act"):
         activation = text_config.hidden_act
     elif hasattr(text_config, "hidden_activation"):
         activation = text_config.hidden_activation
 
     # map activation to supported activation
-    if "gelu" in activation:
+    if activation and "gelu" in activation:
         # gemma3 uses gelu_pytorch_tanh
         activation = "gelu"
 
@@ -379,7 +396,7 @@ def apply_lora_kernel_patches(
     layers = get_layers(model)
 
     # Patch each layer
-    for idx, layer in enumerate(layers):
+    for layer in enumerate(layers):
         # Add QKV, O fallback implementations to start
         # These will be overwritten later (if some conditions apply)
         for self_attn in find_self_attn_in_layer(layer):
@@ -424,32 +441,43 @@ def apply_lora_kernel_patches(
                         "Cannot patch some attention output projection - requires LoRA "
                         "adapters and no lora_magnitude_vector (DoRA)"
                     )
+
+        # MLP patching - skip entirely if lora_mlp_kernel is disabled (including for MoE)
+        if not cfg.lora_mlp_kernel:
+            continue
+
         for gate_proj, up_proj, down_proj, mlp in find_mlp_in_layer(layer):
-            if cfg.lora_mlp_kernel:
-                if (
-                    hasattr(layer, "block_sparse_moe")
-                    or "Moe" in mlp.__class__.__name__
-                ):
-                    LOG.warning_once(
-                        f"Skipping LoRA MLP kernel patch for MoE layer at index {idx}"
-                    )
-                    continue
+            # Additional per-layer MoE check for models that might have mixed architectures
+            is_moe_layer = (
+                hasattr(layer, "block_sparse_moe")
+                or hasattr(layer, "mlp")
+                and hasattr(layer.mlp, "experts")
+                or "Moe" in mlp.__class__.__name__
+                or "Moe" in layer.__class__.__name__
+            )
 
-                # MLP patching
-                can_patch_mlp = all(
-                    hasattr(proj, "lora_A")
-                    and len(getattr(proj, "lora_magnitude_vector", []) or []) == 0
-                    for proj in (gate_proj, up_proj, down_proj)
+            if is_moe_layer:
+                LOG.warning_once(
+                    "Skipping LoRA MLP kernel patch for MoE layer - "
+                    "expert routing is incompatible with synchronized kernel execution"
                 )
+                continue
 
-                if can_patch_mlp:
-                    apply_fn = APPLY_FN_MAPPING[activation]
-                    layer.mlp.forward = types.MethodType(apply_fn, mlp)
-                else:
-                    LOG.warning_once(
-                        "Cannot patch some MLP layers - requires LoRA adapters and no "
-                        "lora_magnitude_vector (DoRA)"
-                    )
+            # MLP patching
+            can_patch_mlp = all(
+                hasattr(proj, "lora_A")
+                and len(getattr(proj, "lora_magnitude_vector", []) or []) == 0
+                for proj in (gate_proj, up_proj, down_proj)
+            )
+
+            if can_patch_mlp:
+                apply_fn = APPLY_FN_MAPPING[activation]
+                mlp.forward = types.MethodType(apply_fn, mlp)
+            else:
+                LOG.warning_once(
+                    "Cannot patch some MLP layers - requires LoRA adapters and no "
+                    "lora_magnitude_vector (DoRA)"
+                )
 
     LOG.setLevel(original_level)
 
