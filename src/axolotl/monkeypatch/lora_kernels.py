@@ -379,7 +379,7 @@ def apply_lora_kernel_patches(
     layers = get_layers(model)
 
     # Patch each layer
-    for layer in layers:
+    for idx, layer in enumerate(layers):
         # Add QKV, O fallback implementations to start
         # These will be overwritten later (if some conditions apply)
         for self_attn in find_self_attn_in_layer(layer):
@@ -426,6 +426,15 @@ def apply_lora_kernel_patches(
                     )
         for gate_proj, up_proj, down_proj, mlp in find_mlp_in_layer(layer):
             if cfg.lora_mlp_kernel:
+                if (
+                    hasattr(layer, "block_sparse_moe")
+                    or "Moe" in mlp.__class__.__name__
+                ):
+                    LOG.warning_once(
+                        f"Skipping LoRA MLP kernel patch for MoE layer at index {idx}"
+                    )
+                    continue
+
                 # MLP patching
                 can_patch_mlp = all(
                     hasattr(proj, "lora_A")
