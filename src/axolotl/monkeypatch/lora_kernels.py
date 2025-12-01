@@ -449,11 +449,11 @@ def apply_lora_kernel_patches(
         for gate_proj, up_proj, down_proj, mlp in find_mlp_in_layer(layer):
             # Additional per-layer MoE check for models that might have mixed architectures
             is_moe_layer = (
-                hasattr(layer, "block_sparse_moe")
-                or hasattr(layer, "mlp")
-                and hasattr(layer.mlp, "experts")
-                or "Moe" in mlp.__class__.__name__
-                or "Moe" in layer.__class__.__name__
+                hasattr(layer, "block_sparse_moe")# Catch Mixtral/Qwen2-MoE (HF)
+                or (hasattr(layer, "mlp")
+                and hasattr(layer.mlp, "experts"))# Catch Llama-MoE/Custom
+                or "Moe" in mlp.__class__.__name__# Catch Jamba, Deepseek, JetMoe
+                or "Moe" in layer.__class__.__name__# Catch Mixed/Wrapper layers
             )
 
             if is_moe_layer:
