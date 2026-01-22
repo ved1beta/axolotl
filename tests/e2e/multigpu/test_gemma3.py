@@ -32,6 +32,12 @@ class TestMultiGPUGemma3:
         cfg = DictDefault(
             {
                 "base_model": "axolotl-mirrors/gemma-3-4b-pt",
+                # Load multimodal model to match checkpoint structure
+                "model_type": "Gemma3ForConditionalGeneration",
+                # Freeze vision tower - only language model params are trainable
+                "unfrozen_parameters": [
+                    "language_model.*",
+                ],
                 "sequence_len": 2048,
                 "ddp_find_unused_parameters": True,
                 "sample_packing": True,
@@ -41,7 +47,7 @@ class TestMultiGPUGemma3:
                 "lora_r": 8,
                 "lora_alpha": 16,
                 "lora_dropout": 0.05,
-                "lora_target_linear": True,
+                "lora_target_modules": r"language_model.model.layers.[\d]+.(mlp|self_attn).(up|down|gate|q|k|v|o)_proj",
                 "val_set_size": 0.0,
                 "chat_template": "gemma3",
                 "datasets": [
