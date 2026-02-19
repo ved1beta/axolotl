@@ -78,20 +78,38 @@ def find_moe_expert_param_names(model: PreTrainedModel) -> list[str]:
     Returns a deduplicated list of parameter path suffixes (e.g.,
     ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]) suitable for
     PEFT's LoraConfig target_parameters.
+
+    Handles two states:
+    - Pre-quantization: detects via ndim >= 3 in named_parameters().
+    - Post-quantization: after replace_parameter_4bit the params appear as ndim=2
+      under parametrizations.*; detects via module.parametrizations instead.
     """
-    seen_suffixes = set()
-    for name, param in model.named_parameters():
-        if param.ndim >= 3 and any(
-            kw in name for kw in ("experts", "gate_up_proj", "down_proj")
-        ):
+    kws = ("gate_up_proj", "down_proj")
+    seen_suffixes: set[str] = set()
+
+    # Post-quantization: params are wrapped in parametrizations by replace_parameter_4bit.
+    for name, module in model.named_modules():
+        if not hasattr(module, "parametrizations"):
+            continue
+        for pname in module.parametrizations:
+            if not any(kw in pname for kw in kws):
+                continue
             parts = name.split(".")
-            # Find the layer index (first numeric segment) and extract the
-            # repeating suffix after it.
-            # e.g. "model.layers.0.mlp.experts.gate_up_proj" -> "mlp.experts.gate_up_proj"
             for i, part in enumerate(parts):
                 if part.isdigit():
-                    suffix = ".".join(parts[i + 1 :])
-                    seen_suffixes.add(suffix)
+                    seen_suffixes.add(".".join(parts[i + 1 :] + [pname]))
+                    break
+
+    if seen_suffixes:
+        return sorted(seen_suffixes)
+
+    # Pre-quantization: params are still plain 3D nn.Parameter tensors.
+    for name, param in model.named_parameters():
+        if param.ndim >= 3 and any(kw in name for kw in kws):
+            parts = name.split(".")
+            for i, part in enumerate(parts):
+                if part.isdigit():
+                    seen_suffixes.add(".".join(parts[i + 1 :]))
                     break
     return sorted(seen_suffixes)
 

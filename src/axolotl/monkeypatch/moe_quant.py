@@ -80,17 +80,18 @@ def quantize_moe_params_during_loading(bnb_config):
         ):
             return  # already quantized
         try:
-            # Checkpoint tensors (safetensors mmap) may be non-contiguous views.
-            # BnB's CUDA kernel requires a contiguous owning tensor, so clone first.
-            if not param.data.is_contiguous():
-                setattr(
-                    module_obj,
-                    param_name,
-                    torch.nn.Parameter(
-                        param.data.clone().contiguous(),
-                        requires_grad=param.requires_grad,
-                    ),
-                )
+            # Always clone: the param's storage may be a non-owning view from the
+            # checkpoint loader (safetensors, shared CUDA buffer, etc.).  BnB's CUDA
+            # kernel requires a contiguous, independently-owned tensor; operating on
+            # a shared view can cause misalignment errors or SIGSEGV.
+            setattr(
+                module_obj,
+                param_name,
+                torch.nn.Parameter(
+                    param.data.clone().contiguous(),
+                    requires_grad=param.requires_grad,
+                ),
+            )
             replace_parameter_4bit(
                 module_obj,
                 param_name,
@@ -98,7 +99,6 @@ def quantize_moe_params_during_loading(bnb_config):
                 quant_type=quant_type,
             )
             quantized_paths.append(target_name)
-            torch.cuda.empty_cache()
         except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("Failed to quantize %s during loading: %s", target_name, exc)
 
@@ -107,6 +107,12 @@ def quantize_moe_params_during_loading(bnb_config):
         yield quantized_paths
     finally:
         cml.set_param_for_module = orig_fn
+        if quantized_paths:
+            torch.cuda.empty_cache()
+            LOG.info(
+                "Quantized %d MoE expert parameters to 4-bit during loading",
+                len(quantized_paths),
+            )
 
 
 def find_unquantized_expert_params(model):
