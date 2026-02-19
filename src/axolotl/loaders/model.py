@@ -169,13 +169,22 @@ class ModelLoader:
         self.patch_manager.apply_pre_model_load_patches()
         self._apply_pre_model_load_setup()
 
-        # Build the model
+        # Build the model, quantizing 3D MoE expert params on-the-fly for qlora+4bit
+        # so they never accumulate as full bf16 on GPU and cause OOM.
         PLUGIN_MANAGER.pre_model_load(self.cfg)
         self.patch_manager.apply_post_plugin_pre_model_load_patches()
-        skip_move_to_device = self._build_model()
+        _quantized_during_load: list[str] = []
+        if self.cfg.adapter in ("qlora", "lora") and self.cfg.load_in_4bit:
+            from axolotl.monkeypatch.moe_quant import quantize_moe_params_during_loading
 
-        # Quantize 3D MoE expert nn.Parameter tensors that BnB skips.
-        # Detect names before quantization (replace_parameter_4bit changes them).
+            bnb_config = self.model_kwargs.get("quantization_config")
+            with quantize_moe_params_during_loading(bnb_config) as _quantized_during_load:
+                skip_move_to_device = self._build_model()
+        else:
+            skip_move_to_device = self._build_model()
+
+        # Handle any 3D MoE expert params not already quantized above
+        # (fallback for older transformers without core_model_loading).
         self.model._moe_experts_quantized = False
         self.model._moe_expert_param_names = []
         if self.cfg.adapter in ("qlora", "lora") and (
@@ -185,7 +194,9 @@ class ModelLoader:
             from axolotl.monkeypatch.moe_quant import quantize_moe_expert_params
 
             self.model._moe_expert_param_names = find_moe_expert_param_names(self.model)
-            self.model._moe_experts_quantized = quantize_moe_expert_params(self.model)
+            self.model._moe_experts_quantized = bool(_quantized_during_load) or (
+                quantize_moe_expert_params(self.model)
+            )
 
         PLUGIN_MANAGER.post_model_build(self.cfg, self.model)
 
