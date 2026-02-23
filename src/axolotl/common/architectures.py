@@ -18,4 +18,6 @@ MOE_ARCH_BLOCK = {
     "gpt_oss": "GptOssDecoderLayer",
     "lfm2_moe": "Lfm2MoeSparseMoeBlock",
     "afmoe": "AfmoeMoE",
+    "glm4_moe": "Glm4MoeMoE",
+    "glm4_moe_lite": "Glm4MoeLiteMoE",
 }
