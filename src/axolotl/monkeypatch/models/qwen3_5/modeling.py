@@ -1,5 +1,10 @@
-"""Monkeypatch for Qwen3_5 and Qwen3_5Moe models to pass position_ids to linear attention."""
+"""Monkeypatch for Qwen3_5 and Qwen3_5Moe models to pass position_ids to linear attention.
 
+Both model variants (dense qwen3_5 and MoE qwen3_5_moe) share the same GatedDeltaNet
+architecture, so a single set of forward implementations is patched into both.
+"""
+
+import importlib
 from typing import Optional, Tuple
 
 import torch
@@ -8,6 +13,11 @@ import torch.nn.functional as F
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+try:
+    from fla.modules.conv import causal_conv1d as fla_causal_conv1d
+except ImportError:
+    fla_causal_conv1d = None
 
 
 def get_cu_seqlens(position_ids):
@@ -32,29 +42,12 @@ def get_cu_seqlens(position_ids):
 
 
 # ---------------------------------------------------------------------------
-# Dense (qwen3_5)
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 
-def patch_qwen3_5_imports():
-    """Patch Qwen3_5 imports to use FLA kernels instead of is_flash_linear_attention_available."""
-    try:
-        import transformers.models.qwen3_5.modeling_qwen3_5 as qwen3_5_modeling
-    except ImportError:
-        LOG.warning("Qwen3_5 model not found, skipping import patch")
-        return
-
-    original_FusedRMSNormGated = getattr(qwen3_5_modeling, "FusedRMSNormGated", None)
-    original_chunk_gated_delta_rule = getattr(
-        qwen3_5_modeling, "chunk_gated_delta_rule", None
-    )
-    original_fused_recurrent_gated_delta_rule = getattr(
-        qwen3_5_modeling, "fused_recurrent_gated_delta_rule", None
-    )
-    original_is_fast_path_available = getattr(
-        qwen3_5_modeling, "is_fast_path_available", False
-    )
-
+def _inject_fla_kernels(module) -> None:
+    """Inject FLA kernels into a modeling module, bypassing is_flash_linear_attention_available."""
     try:
         from fla.modules import FusedRMSNormGated
         from fla.ops.gated_delta_rule import (
@@ -62,120 +55,77 @@ def patch_qwen3_5_imports():
             fused_recurrent_gated_delta_rule,
         )
 
-        qwen3_5_modeling.FusedRMSNormGated = FusedRMSNormGated
-        qwen3_5_modeling.chunk_gated_delta_rule = chunk_gated_delta_rule
-        qwen3_5_modeling.fused_recurrent_gated_delta_rule = (
-            fused_recurrent_gated_delta_rule
-        )
-
-        # Force is_fast_path_available to be True
-        # fla has triton kernels for causal_conv1d
-        qwen3_5_modeling.is_fast_path_available = True
+        module.FusedRMSNormGated = FusedRMSNormGated
+        module.chunk_gated_delta_rule = chunk_gated_delta_rule
+        module.fused_recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
+        module.is_fast_path_available = True
     except ImportError:
-        qwen3_5_modeling.chunk_gated_delta_rule = None
-        qwen3_5_modeling.fused_recurrent_gated_delta_rule = None
-        qwen3_5_modeling.FusedRMSNormGated = None
+        module.chunk_gated_delta_rule = None
+        module.fused_recurrent_gated_delta_rule = None
+        module.FusedRMSNormGated = None
 
-    def unpatch():
-        """Restore the original import values"""
-        qwen3_5_modeling.FusedRMSNormGated = original_FusedRMSNormGated
-        qwen3_5_modeling.chunk_gated_delta_rule = original_chunk_gated_delta_rule
-        qwen3_5_modeling.fused_recurrent_gated_delta_rule = (
-            original_fused_recurrent_gated_delta_rule
+
+def _patched_decoder_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values=None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> torch.FloatTensor:
+    """Shared decoder layer forward — threads position_ids into linear attention."""
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+
+    if self.layer_type == "linear_attention":
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
-        qwen3_5_modeling.is_fast_path_available = original_is_fast_path_available
-
-    return unpatch
-
-
-def patch_qwen3_5_decoder_layer():
-    """Patch Qwen3_5DecoderLayer to pass position_ids to linear attention."""
-    try:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import (
-            Qwen3_5DecoderLayer,
+    elif self.layer_type == "full_attention":
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
         )
-    except ImportError:
-        LOG.warning("Qwen3_5 model not found, skipping patch")
-        return
 
-    original_decoder_forward = Qwen3_5DecoderLayer.forward
+    hidden_states = residual + hidden_states
 
-    def patched_decoder_forward(
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    # MoE layers return (hidden_states, router_logits) — unpack
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+    hidden_states = residual + hidden_states
+
+    return hidden_states
+
+
+def _make_gated_delta_forward(apply_mask_fn):
+    """
+    Factory: returns the patched GatedDeltaNet forward, closing over the module-specific
+    apply_mask_to_padding_states function so the body stays model-type agnostic.
+    """
+
+    def patched_forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values=None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states=hidden_states,
-                cache_params=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
-        elif self.layer_type == "full_attention":
-            hidden_states, _ = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        # For the MoE layers, unpack tuple output
-        if isinstance(hidden_states, Tuple):
-            hidden_states, _ = hidden_states
-        hidden_states = residual + hidden_states
-
-        return hidden_states
-
-    Qwen3_5DecoderLayer.forward = patched_decoder_forward
-
-    def unpatch():
-        Qwen3_5DecoderLayer.forward = original_decoder_forward
-
-    return unpatch
-
-
-def patch_qwen3_5_gateddelta_layer():
-    """Patch Qwen3_5GatedDeltaNet to parse cu_seqlens and pass to chunk_gated_delta_rule."""
-    try:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import (
-            Qwen3_5DynamicCache,
-            Qwen3_5GatedDeltaNet,
-            apply_mask_to_padding_states,
-        )
-    except ImportError:
-        LOG.warning("Qwen3_5 model not found, skipping patch")
-        return
-
-    original_gated_delta_net_forward = Qwen3_5GatedDeltaNet.forward
-
-    def patched_gated_delta_net_forward(
-        self,
-        hidden_states: torch.Tensor,
-        cache_params: Optional[Qwen3_5DynamicCache] = None,
+        cache_params=None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        hidden_states = apply_mask_fn(hidden_states, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -185,6 +135,11 @@ def patch_qwen3_5_gateddelta_layer():
             and seq_len == 1
             and cache_position is not None
         )
+
+        # Compute cu_seqlens once early — reused by causal_conv1d AND chunk_gated_delta_rule
+        cu_seqlens = None
+        if not use_precomputed_states and position_ids is not None:
+            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
 
         if cache_params is not None:
             conv_state = cache_params.conv_states[self.layer_idx]
@@ -199,10 +154,11 @@ def patch_qwen3_5_gateddelta_layer():
             x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value)
         )
 
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        mixed_qkv = torch.cat((query, key, value), dim=-1)  # [B, T, D]
 
         if use_precomputed_states:
+            # Inference single-token path: causal_conv1d_update expects [B, D, T]
+            mixed_qkv = mixed_qkv.transpose(1, 2)
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -210,31 +166,39 @@ def patch_qwen3_5_gateddelta_layer():
                 self.conv1d.bias,
                 self.activation,
             )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
         else:
             if cache_params is not None:
-                conv_state = F.pad(
-                    mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0)
+                # Cache expects [B, D, T]
+                mixed_qkv_t = mixed_qkv.transpose(1, 2)
+                cache_params.conv_states[self.layer_idx] = F.pad(
+                    mixed_qkv_t,
+                    (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0),
                 )
-                cache_params.conv_states[self.layer_idx] = conv_state
-            if self.causal_conv1d_fn is not None:
-                mixed_qkv = self.causal_conv1d_fn(
+
+            if fla_causal_conv1d is not None:
+                # FLA Triton kernel: [B, T, D] in/out, cu_seqlens resets state at boundaries
+                mixed_qkv, _ = fla_causal_conv1d(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    seq_idx=None,
+                    cu_seqlens=cu_seqlens,
                 )
             else:
+                # PyTorch fallback — no cu_seqlens, conv state leaks across packed sequences
+                LOG.warning_once(
+                    "FLA causal_conv1d not available. Falling back to PyTorch conv1d "
+                    "which does not support cu_seqlens for packed sequences."
+                )
+                mixed_qkv = mixed_qkv.transpose(1, 2)
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+                mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        # mixed_qkv is [B, T, D] in all paths from here
         query, key, value = torch.split(
             mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
+            [self.key_dim, self.key_dim, self.value_dim],
             dim=-1,
         )
         query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
@@ -248,7 +212,6 @@ def patch_qwen3_5_gateddelta_layer():
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
                 query,
                 key,
@@ -284,292 +247,50 @@ def patch_qwen3_5_gateddelta_layer():
             core_attn_out.shape[0], core_attn_out.shape[1], -1
         )
 
-        output = self.out_proj(core_attn_out)
-        return output
+        return self.out_proj(core_attn_out)
 
-    Qwen3_5GatedDeltaNet.forward = patched_gated_delta_net_forward
+    return patched_forward
 
-    def unpatch():
-        Qwen3_5GatedDeltaNet.forward = original_gated_delta_net_forward
 
-    return unpatch
+# ---------------------------------------------------------------------------
+# Unified patch entry point
+# ---------------------------------------------------------------------------
+
+
+def _apply_packing_patches(model_type: str, cls_prefix: str) -> None:
+    """
+    Apply all sample-packing patches for a qwen3_5 variant.
+
+    Args:
+        model_type:  transformers model_type string, e.g. "qwen3_5" or "qwen3_5_moe"
+        cls_prefix:  class name prefix, e.g. "Qwen3_5" or "Qwen3_5Moe"
+    """
+    module_name = f"transformers.models.{model_type}.modeling_{model_type}"
+
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        LOG.warning(f"{model_type} not found in transformers, skipping packing patches")
+        return
+
+    _inject_fla_kernels(module)
+
+    getattr(module, f"{cls_prefix}DecoderLayer").forward = _patched_decoder_forward
+
+    gated_cls = getattr(module, f"{cls_prefix}GatedDeltaNet")
+    gated_cls.forward = _make_gated_delta_forward(module.apply_mask_to_padding_states)
+
+    LOG.info(f"Applied {cls_prefix} packing patch (fla_causal_conv1d={'available' if fla_causal_conv1d else 'unavailable'})")
+
+
+# ---------------------------------------------------------------------------
+# Public API — called from patch_manager.py
+# ---------------------------------------------------------------------------
 
 
 def patch_qwen3_5_modeling_packing():
-    """Apply all Qwen3_5 model patches for sample packing."""
-    patch_qwen3_5_imports()
-    patch_qwen3_5_decoder_layer()
-    patch_qwen3_5_gateddelta_layer()
-
-    LOG.info("Applied Qwen3_5 patch for packing")
-
-
-# ---------------------------------------------------------------------------
-# MoE (qwen3_5_moe)
-# ---------------------------------------------------------------------------
-
-
-def patch_qwen3_5_moe_imports():
-    """Patch Qwen3_5Moe imports to use FLA kernels."""
-    try:
-        import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_moe_modeling
-    except ImportError:
-        LOG.warning("Qwen3_5Moe model not found, skipping import patch")
-        return
-
-    original_FusedRMSNormGated = getattr(
-        qwen3_5_moe_modeling, "FusedRMSNormGated", None
-    )
-    original_chunk_gated_delta_rule = getattr(
-        qwen3_5_moe_modeling, "chunk_gated_delta_rule", None
-    )
-    original_fused_recurrent_gated_delta_rule = getattr(
-        qwen3_5_moe_modeling, "fused_recurrent_gated_delta_rule", None
-    )
-    original_is_fast_path_available = getattr(
-        qwen3_5_moe_modeling, "is_fast_path_available", False
-    )
-
-    try:
-        from fla.modules import FusedRMSNormGated
-        from fla.ops.gated_delta_rule import (
-            chunk_gated_delta_rule,
-            fused_recurrent_gated_delta_rule,
-        )
-
-        qwen3_5_moe_modeling.FusedRMSNormGated = FusedRMSNormGated
-        qwen3_5_moe_modeling.chunk_gated_delta_rule = chunk_gated_delta_rule
-        qwen3_5_moe_modeling.fused_recurrent_gated_delta_rule = (
-            fused_recurrent_gated_delta_rule
-        )
-        qwen3_5_moe_modeling.is_fast_path_available = True
-    except ImportError:
-        qwen3_5_moe_modeling.chunk_gated_delta_rule = None
-        qwen3_5_moe_modeling.fused_recurrent_gated_delta_rule = None
-        qwen3_5_moe_modeling.FusedRMSNormGated = None
-
-    def unpatch():
-        qwen3_5_moe_modeling.FusedRMSNormGated = original_FusedRMSNormGated
-        qwen3_5_moe_modeling.chunk_gated_delta_rule = original_chunk_gated_delta_rule
-        qwen3_5_moe_modeling.fused_recurrent_gated_delta_rule = (
-            original_fused_recurrent_gated_delta_rule
-        )
-        qwen3_5_moe_modeling.is_fast_path_available = original_is_fast_path_available
-
-    return unpatch
-
-
-def patch_qwen3_5_moe_decoder_layer():
-    """Patch Qwen3_5MoeDecoderLayer to pass position_ids to linear attention."""
-    try:
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            Qwen3_5MoeDecoderLayer,
-        )
-    except ImportError:
-        LOG.warning("Qwen3_5Moe model not found, skipping patch")
-        return
-
-    original_decoder_forward = Qwen3_5MoeDecoderLayer.forward
-
-    def patched_decoder_forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values=None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states=hidden_states,
-                cache_params=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
-        elif self.layer_type == "full_attention":
-            hidden_states, _ = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        # MoE returns a tuple (hidden_states, router_logits)
-        if isinstance(hidden_states, Tuple):
-            hidden_states, _ = hidden_states
-        hidden_states = residual + hidden_states
-
-        return hidden_states
-
-    Qwen3_5MoeDecoderLayer.forward = patched_decoder_forward
-
-    def unpatch():
-        Qwen3_5MoeDecoderLayer.forward = original_decoder_forward
-
-    return unpatch
-
-
-def patch_qwen3_5_moe_gateddelta_layer():
-    """Patch Qwen3_5MoeGatedDeltaNet to parse cu_seqlens and pass to chunk_gated_delta_rule."""
-    try:
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            Qwen3_5MoeDynamicCache,
-            Qwen3_5MoeGatedDeltaNet,
-            apply_mask_to_padding_states,
-        )
-    except ImportError:
-        LOG.warning("Qwen3_5Moe model not found, skipping patch")
-        return
-
-    original_gated_delta_net_forward = Qwen3_5MoeGatedDeltaNet.forward
-
-    def patched_gated_delta_net_forward(
-        self,
-        hidden_states: torch.Tensor,
-        cache_params: Optional[Qwen3_5MoeDynamicCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-    ):
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-
-        batch_size, seq_len, _ = hidden_states.shape
-
-        use_precomputed_states = (
-            cache_params is not None
-            and cache_params.has_previous_state
-            and seq_len == 1
-            and cache_position is not None
-        )
-
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
-
-        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
-            projected_states_qkvz, projected_states_ba
-        )
-        query, key, value = (
-            x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value)
-        )
-
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        if use_precomputed_states:
-            mixed_qkv = self.causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                self.activation,
-            )
-        else:
-            if cache_params is not None:
-                conv_state = F.pad(
-                    mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0)
-                )
-                cache_params.conv_states[self.layer_idx] = conv_state
-            if self.causal_conv1d_fn is not None:
-                mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                )
-            else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
-            dim=-1,
-        )
-        query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
-        key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
-        value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        if not use_precomputed_states:
-            cu_seqlens = get_cu_seqlens(position_ids=position_ids)
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
-        else:
-            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
-
-        if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
-
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
-            core_attn_out.shape[0], core_attn_out.shape[1], -1
-        )
-
-        output = self.out_proj(core_attn_out)
-        return output
-
-    Qwen3_5MoeGatedDeltaNet.forward = patched_gated_delta_net_forward
-
-    def unpatch():
-        Qwen3_5MoeGatedDeltaNet.forward = original_gated_delta_net_forward
-
-    return unpatch
+    _apply_packing_patches("qwen3_5", "Qwen3_5")
 
 
 def patch_qwen3_5_moe_modeling_packing():
-    """Apply all Qwen3_5Moe model patches for sample packing."""
-    patch_qwen3_5_moe_imports()
-    patch_qwen3_5_moe_decoder_layer()
-    patch_qwen3_5_moe_gateddelta_layer()
-
-    LOG.info("Applied Qwen3_5Moe patch for packing")
+    _apply_packing_patches("qwen3_5_moe", "Qwen3_5Moe")
