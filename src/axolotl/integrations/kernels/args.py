@@ -34,14 +34,44 @@ class KernelsArgs(BaseModel):
     @classmethod
     def check_experts_implementation(cls, data):
         experts_implementation = data.get("experts_implementation")
+        use_scattermoe = data.get("use_scattermoe", False)
         if experts_implementation is None:
             # transformers may default to batched_mm when unset
             data["experts_implementation"] = "eager"
-        elif experts_implementation != "eager":
+        elif experts_implementation == "scattermoe" and not use_scattermoe:
             LOG.warning(
-                "`experts_implementation` must be set to 'eager' to use this. Automatically setting it to 'eager'."
+                "`experts_implementation='scattermoe'` requires `use_scattermoe: true`. "
+                "Automatically setting to 'eager'."
             )
             data["experts_implementation"] = "eager"
+        elif experts_implementation not in ("eager", "scattermoe"):
+            LOG.warning(
+                f"`experts_implementation={experts_implementation!r}` is not compatible with "
+                f"custom MoE kernels. Automatically setting to 'eager'."
+            )
+            data["experts_implementation"] = "eager"
+
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def warn_sonicmoe_lora_overhead(cls, data):
+        if data.get("use_sonicmoe") is True and data.get("adapter") in (
+            "lora",
+            "qlora",
+        ):
+            lora_target = data.get("lora_target_modules") or []
+            lora_linear = data.get("lora_target_linear_modules") or []
+            targets = (
+                lora_target if isinstance(lora_target, list) else [lora_target]
+            ) + (lora_linear if isinstance(lora_linear, list) else [lora_linear])
+            expert_keywords = ("gate_up_proj", "down_proj", "experts")
+            if any(kw in t for t in targets for kw in expert_keywords):
+                LOG.info(
+                    "SonicMoE + LoRA on expert modules uses runtime weight materialization "
+                    "(W_eff = W + scaling*B@A per forward). This has slightly higher overhead "
+                    "than ScatterMoE's fused Triton LoRA kernels but works with any CUTLASS kernel."
+                )
 
         return data
 
