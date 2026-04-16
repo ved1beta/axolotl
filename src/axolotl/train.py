@@ -292,13 +292,27 @@ def save_trained_model(
             return
 
     if trainer.is_fsdp_enabled or cfg.fsdp_config:
+        fsdp_plugin = getattr(trainer.accelerator.state, "fsdp_plugin", None)
+        is_fsdp2 = (
+            fsdp_plugin is not None
+            and getattr(fsdp_plugin, "fsdp_version", 1) == 2
+        )
+
         if cfg.fsdp_config or cfg.fsdp:
             if cfg.fsdp_config.final_state_dict_type:
                 state_dict_type = cfg.fsdp_config.final_state_dict_type
             else:
                 state_dict_type = cfg.fsdp_config.state_dict_type
+
+            if is_fsdp2:
+                # FSDP2's monkeypatched get_state_dict always gathers full
+                # tensors to rank 0 regardless of the state_dict_type setting.
+                # Force FULL_STATE_DICT so HF Trainer's save_model actually
+                # saves the model, and skip the FSDP1 merge path below.
+                state_dict_type = "FULL_STATE_DICT"
+
             trainer.accelerator.state.fsdp_plugin.set_state_dict_type(state_dict_type)
-        trainer.save_model(cfg.output_dir)  # only handles FULL_STATE_DICT
+        trainer.save_model(cfg.output_dir)
         if state_dict_type == "SHARDED_STATE_DICT":
             LOG.info(
                 "The final model was saved with a sharded state dict. Please ensure you merge "
@@ -307,6 +321,7 @@ def save_trained_model(
             checkpoint_dir = determine_last_checkpoint(cfg, update=False)
             if (
                 not (Path(cfg.output_dir) / "model.safetensors.index.json").exists()
+                and not (Path(cfg.output_dir) / "model.safetensors").exists()
                 and checkpoint_dir
             ):
                 # import here to prevent circular import
