@@ -1,11 +1,17 @@
-"""FSDP2-aware optimizer and scheduler checkpoint save/load.
+"""FSDP2-aware checkpoint save/load.
 
-The upstream HF Trainer._save_optimizer_and_scheduler relies on
-accelerate's save_fsdp_optimizer which can fail when Axolotl's custom
-fsdp2_prepare_model path is used.  This mixin replaces the blanket
-try/except with a proper implementation that uses PyTorch's distributed
-checkpoint APIs directly for FSDP2, and falls back to the upstream
-Trainer for all other distributed backends.
+accelerate.save_fsdp_model branches between a single pytorch_model_fsdp.bin
+file and a pytorch_model_fsdp_0/ directory based on
+fsdp_plugin.state_dict_type.  Under FSDP2 that attribute is not
+guaranteed to agree between the save run and the resume run, so the
+file that load_fsdp_model looks for may never have been written and
+resuming crashes with FileNotFoundError.
+
+This mixin bypasses save_fsdp_model and writes the model state dict
+ourselves as pytorch_model_fsdp.bin using Axolotl's monkeypatched
+Accelerator.get_state_dict, which always gathers FSDP2 DTensors to
+full tensors on rank 0.  Optimizer save/load stays on accelerate's
+save_fsdp_optimizer / load_fsdp_optimizer, which use PyTorch DCP APIs.
 """
 
 import os
@@ -17,6 +23,7 @@ from transformers import Trainer
 from axolotl.utils.logging import get_logger
 
 SCHEDULER_NAME = "scheduler.pt"
+FSDP_MODEL_FILE = "pytorch_model_fsdp.bin"
 
 LOG = get_logger(__name__)
 
@@ -31,121 +38,39 @@ def _is_fsdp2(trainer: Trainer) -> bool:
     )
 
 
-def _get_state_dict_type(trainer: Trainer) -> str:
-    """Return the configured state dict type string ('FULL_STATE_DICT', etc.)."""
-    fsdp_plugin = trainer.accelerator.state.fsdp_plugin
-    sdt = getattr(fsdp_plugin, "state_dict_type", None)
-    if sdt is None:
-        return "FULL_STATE_DICT"
-    return sdt.name if hasattr(sdt, "name") else str(sdt)
+def _save_fsdp2_model(trainer: Trainer, output_dir: str) -> None:
+    """Save the FSDP2 model as pytorch_model_fsdp.bin on rank 0.
 
-
-def _save_fsdp2_optimizer(trainer: Trainer, output_dir: str) -> None:
-    """Save optimizer state under FSDP2 using PyTorch DCP APIs."""
-    from torch.distributed.checkpoint.state_dict import (
-        StateDictOptions,
-        get_optimizer_state_dict,
-    )
-
-    fsdp_plugin = trainer.accelerator.state.fsdp_plugin
-    is_full = _get_state_dict_type(trainer) == "FULL_STATE_DICT"
-
-    sd_options = StateDictOptions(
-        full_state_dict=is_full,
-        cpu_offload=getattr(fsdp_plugin.state_dict_config, "offload_to_cpu", False),
-        broadcast_from_rank0=getattr(
-            fsdp_plugin.state_dict_config, "rank0_only", False
-        ),
-    )
-
-    optim_state = get_optimizer_state_dict(
-        trainer.model, trainer.optimizer, options=sd_options
-    )
-
-    if is_full:
-        if trainer.args.process_index == 0:
-            optim_file = os.path.join(output_dir, "optimizer.bin")
-            LOG.info("Saving FSDP2 optimizer state (FULL) to %s", optim_file)
-            torch.save(optim_state, optim_file)
-    else:
-        import torch.distributed.checkpoint as dist_cp
-        from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
-
-        ckpt_dir = os.path.join(output_dir, "optimizer_0")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        LOG.info("Saving FSDP2 optimizer state (SHARDED) to %s", ckpt_dir)
-        dist_cp.save(
-            state_dict={"optimizer": optim_state},
-            storage_writer=dist_cp.FileSystemWriter(ckpt_dir),
-            planner=DefaultSavePlanner(),
-        )
-
-
-def _load_fsdp2_optimizer(trainer: Trainer, checkpoint: str) -> None:
-    """Load optimizer state under FSDP2 using PyTorch DCP APIs."""
-    from torch.distributed.checkpoint.state_dict import (
-        StateDictOptions,
-        get_optimizer_state_dict,
-        set_optimizer_state_dict,
-    )
-
-    fsdp_plugin = trainer.accelerator.state.fsdp_plugin
-    is_full = _get_state_dict_type(trainer) == "FULL_STATE_DICT"
-
-    sd_options = StateDictOptions(
-        full_state_dict=is_full,
-        cpu_offload=getattr(fsdp_plugin.state_dict_config, "offload_to_cpu", False),
-        broadcast_from_rank0=getattr(
-            fsdp_plugin.state_dict_config, "rank0_only", False
-        ),
-    )
-
-    if is_full:
-        optim_state = None
-        optim_file = os.path.join(checkpoint, "optimizer.bin")
-        if trainer.args.process_index == 0 or not getattr(
-            fsdp_plugin.optim_state_dict_config, "rank0_only", False
-        ):
-            LOG.info("Loading FSDP2 optimizer state (FULL) from %s", optim_file)
-            optim_state = torch.load(optim_file, weights_only=True)
-    else:
-        import torch.distributed.checkpoint as dist_cp
-
-        ckpt_dir = os.path.join(checkpoint, "optimizer_0")
-        if not os.path.isdir(ckpt_dir) and "optimizer" in checkpoint:
-            ckpt_dir = checkpoint
-        LOG.info("Loading FSDP2 optimizer state (SHARDED) from %s", ckpt_dir)
-
-        optim_state = get_optimizer_state_dict(
-            trainer.model, trainer.optimizer, options=sd_options
-        )
-        optim_state = {"optimizer": optim_state}
-        dist_cp.load(
-            optim_state,
-            checkpoint_id=ckpt_dir,
-            storage_reader=dist_cp.FileSystemReader(ckpt_dir),
-        )
-        optim_state = optim_state["optimizer"]
-
-    set_optimizer_state_dict(
-        trainer.model, trainer.optimizer, optim_state, options=sd_options
-    )
+    The monkeypatched Accelerator.get_state_dict gathers all DTensors
+    into full tensors on rank 0, regardless of fsdp_plugin.state_dict_type.
+    We always produce FSDP_MODEL_FILE so that accelerate.load_fsdp_model
+    (called by HF Trainer under FULL_STATE_DICT) finds it on resume.
+    """
+    state_dict = trainer.accelerator.get_state_dict(trainer.model)
+    if trainer.args.process_index == 0:
+        output_file = os.path.join(output_dir, FSDP_MODEL_FILE)
+        LOG.info("Saving FSDP2 model state to %s", output_file)
+        torch.save(state_dict, output_file)
 
 
 class CheckpointSaveMixin(Trainer):
-    """Mixin providing FSDP2-aware optimizer/scheduler checkpoint save and load."""
+    """Mixin providing FSDP2-aware checkpoint save and load."""
 
     def _save_optimizer_and_scheduler(self, output_dir):
         if _is_fsdp2(self):
-            try:
-                _save_fsdp2_optimizer(self, output_dir)
-            except Exception as exc:
-                LOG.error(
-                    "Failed to save FSDP2 optimizer state: %s. "
-                    "Checkpoint resumption will not restore optimizer state.",
-                    exc,
-                )
-                raise
+            from accelerate.utils import save_fsdp_optimizer
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            _save_fsdp2_model(self, output_dir)
+
+            save_fsdp_optimizer(
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.optimizer,
+                self.model,
+                output_dir,
+            )
 
             if self.args.should_save:
                 with warnings.catch_warnings(record=True):
@@ -161,6 +86,8 @@ class CheckpointSaveMixin(Trainer):
             return
 
         if _is_fsdp2(self):
+            from accelerate.utils import load_fsdp_optimizer
+
             optim_file = os.path.join(checkpoint, "optimizer.bin")
             optim_dir = os.path.join(checkpoint, "optimizer_0")
             scheduler_file = os.path.join(checkpoint, SCHEDULER_NAME)
@@ -168,27 +95,31 @@ class CheckpointSaveMixin(Trainer):
             has_optim = os.path.isfile(optim_file) or os.path.isdir(optim_dir)
             has_scheduler = os.path.isfile(scheduler_file)
 
-            if has_optim and has_scheduler:
-                LOG.info(
-                    "Resuming FSDP2 optimizer + scheduler from checkpoint: %s",
+            if not has_optim:
+                LOG.warning(
+                    "No FSDP2 optimizer checkpoint found at %s — "
+                    "training will start with a fresh optimizer.",
                     checkpoint,
                 )
-                _load_fsdp2_optimizer(self, checkpoint)
+                return
 
+            LOG.info("Resuming FSDP2 optimizer from checkpoint: %s", checkpoint)
+            load_fsdp_optimizer(
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.optimizer,
+                self.model,
+                checkpoint,
+            )
+
+            if has_scheduler:
                 with warnings.catch_warnings(record=True):
                     self.lr_scheduler.load_state_dict(
                         torch.load(scheduler_file, weights_only=True)
                     )
-            elif has_optim:
-                LOG.warning(
-                    "Found optimizer checkpoint but no scheduler state at %s",
-                    checkpoint,
-                )
-                _load_fsdp2_optimizer(self, checkpoint)
             else:
                 LOG.warning(
-                    "No FSDP2 optimizer checkpoint found at %s — "
-                    "training will start with a fresh optimizer.",
+                    "Found optimizer checkpoint but no scheduler state at %s",
                     checkpoint,
                 )
         else:
