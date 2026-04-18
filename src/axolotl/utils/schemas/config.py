@@ -1,5 +1,6 @@
 """Module with Pydantic models for configuration."""
 
+import re
 from typing import Annotated, Any, Literal
 
 from accelerate.utils import is_fp8_available
@@ -577,6 +578,17 @@ class AxolotlInputConfig(
         },
     )
 
+    freeze_mm_modules: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Freeze multimodal encoder parameters (vision, audio, etc.) for "
+            "text-only training of multimodal models. When True, parameters belonging to "
+            "vision towers, audio towers, multimodal projectors, and similar non-language "
+            "modules are frozen (requires_grad=False). This allows DDP training without "
+            "ddp_find_unused_parameters=True."
+        },
+    )
+
     unfrozen_parameters: list[str] | None = Field(
         default=None,
         json_schema_extra={
@@ -762,6 +774,15 @@ class AxolotlInputConfig(
         default=None,
         json_schema_extra={
             "description": "Specify a custom attention implementation, used mostly for kernels."
+        },
+    )
+
+    gemma4_hybrid_attn_impl: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Use hybrid attention for Gemma 4: flash_attention_2 for sliding window layers "
+            "and sdpa for global (full_attention) layers. Global layers have head_dim=512 which "
+            "exceeds flash attention's supported size."
         },
     )
 
@@ -1335,6 +1356,39 @@ class AxolotlInputConfig(
             LOG.warning(
                 "We found loss to drop to 0 with SageAttention full finetuning."
                 "Please observe the loss, otherwise switch to LoRA/QLoRA or another attention method."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_save_strategy_best_requires_metric(cls, data):
+        if data.get("save_strategy") == "best" and not data.get(
+            "metric_for_best_model"
+        ):
+            raise ValueError(
+                "save_strategy: 'best' requires metric_for_best_model to be set. "
+                "Please specify the metric to use, e.g. metric_for_best_model: eval_loss"
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_lora_target_modules_regex(cls, data):
+        lora_target_modules = data.get("lora_target_modules")
+        if not isinstance(lora_target_modules, list):
+            return data
+        invalid = []
+        for pattern in lora_target_modules:
+            if not isinstance(pattern, str):
+                continue
+            try:
+                re.compile(pattern)
+            except re.error:
+                invalid.append(pattern)
+        if invalid:
+            raise ValueError(
+                f"lora_target_modules contains invalid regex pattern(s): {invalid}. "
+                "Please provide valid Python regex patterns or plain module name strings."
             )
         return data
 

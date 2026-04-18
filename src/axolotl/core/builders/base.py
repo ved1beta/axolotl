@@ -41,6 +41,7 @@ from axolotl.utils.callbacks import (
     GCCallback,
     SaveAxolotlConfigtoWandBCallback,
     SaveModelOnFirstStepCallback,
+    SkipEvalOnResumeCallback,
 )
 from axolotl.utils.callbacks.profiler import PytorchProfilerCallback
 from axolotl.utils.distributed import build_parallelism_config
@@ -117,6 +118,9 @@ class TrainerBuilderBase(abc.ABC):
         callbacks.extend(
             plugin_manager.add_callbacks_pre_trainer(cfg=self.cfg, model=self.model)
         )
+
+        if self.cfg.resume_from_checkpoint:
+            callbacks.append(SkipEvalOnResumeCallback())
 
         if self.cfg.gc_steps:
             callbacks.append(GCCallback(gc_steps=self.cfg.gc_steps))
@@ -329,7 +333,7 @@ class TrainerBuilderBase(abc.ABC):
                 optimizer_cls = AdamW
                 optimizer_kwargs.update(adam_kwargs)
             elif self.cfg.optimizer == "ao_adamw_fp8":
-                from torchao.prototype.low_bit_optim import AdamWFp8
+                from torchao.optim.adam import AdamWFp8
 
                 optimizer_cls = AdamWFp8
                 optimizer_kwargs.update(adam_kwargs)

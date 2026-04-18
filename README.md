@@ -86,7 +86,7 @@ Features:
 **Requirements**:
 
 - NVIDIA GPU (Ampere or newer for `bf16` and Flash Attention) or AMD GPU
-- Python 3.11
+- Python >=3.11 (3.12 recommended)
 - PyTorch ≥2.9.1
 
 ### Google Colab
@@ -94,6 +94,34 @@ Features:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/axolotl-ai-cloud/axolotl/blob/main/examples/colab-notebooks/colab-axolotl-example.ipynb#scrollTo=msOCO4NRmRLa)
 
 ### Installation
+
+#### Using uv (recommended)
+
+```bash
+# install uv if you don't already have it installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+
+# CUDA 12.8.1 tends to have better package compatibility
+export UV_TORCH_BACKEND=cu128
+
+# create a new virtual environment
+uv venv --python 3.12
+source .venv/bin/activate
+
+uv pip install torch==2.10.0 torchvision
+uv pip install --no-build-isolation axolotl[deepspeed]
+
+# recommended - install cut-cross-entropy
+uv pip install "cut-cross-entropy[transformers] @ git+https://github.com/axolotl-ai-cloud/ml-cross-entropy.git@main"
+
+# (optional) - prefetch flash-attn2 and causal-conv1d kernels
+uv run --python 3.12 python -c "from kernels import get_kernel; get_kernel('kernels-community/flash-attn2'); get_kernel('kernels-community/causal-conv1d')"
+
+# Download example axolotl configs, deepspeed configs
+axolotl fetch examples
+axolotl fetch deepspeed_configs  # OPTIONAL
+```
 
 #### Using pip
 
@@ -156,6 +184,29 @@ That's it! Check out our [Getting Started Guide](https://docs.axolotl.ai/docs/ge
 - [Multipacking](https://docs.axolotl.ai/docs/multipack.html)
 - [API Reference](https://docs.axolotl.ai/docs/api/) - Auto-generated code documentation
 - [FAQ](https://docs.axolotl.ai/docs/faq.html) - Frequently asked questions
+
+## AI Agent Support
+
+Axolotl ships with built-in documentation optimized for AI coding agents (Claude Code, Cursor, Copilot, etc.). These docs are bundled with the pip package — no repo clone needed.
+
+```bash
+# Show overview and available training methods
+axolotl agent-docs
+
+# Topic-specific references
+axolotl agent-docs sft                 # supervised fine-tuning
+axolotl agent-docs grpo                # GRPO online RL
+axolotl agent-docs preference_tuning   # DPO, KTO, ORPO, SimPO
+axolotl agent-docs reward_modelling    # outcome and process reward models
+axolotl agent-docs pretraining         # continual pretraining
+axolotl agent-docs --list              # list all topics
+
+# Dump config schema for programmatic use
+axolotl config-schema
+axolotl config-schema --field adapter
+```
+
+If you're working with the source repo, agent docs are also available at `docs/agents/` and the project overview is in `AGENTS.md`.
 
 ## 🤝 Getting Help
 

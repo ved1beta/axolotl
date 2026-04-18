@@ -100,6 +100,27 @@ class AxolotlTrainer(
         self._signature_columns = None  # workaround for pylint
 
         super().__init__(*_args, **kwargs)
+
+        # Gemma4 (and similar multimodal models) declare **kwargs in forward() for
+        # extra inputs like mm_token_type_ids.  HF Trainer interprets VAR_KEYWORD as
+        # "the model handles num_items_in_batch internally" and skips the loss ÷
+        # gradient_accumulation_steps normalisation, which inflates the *logged* loss
+        # (the gradient itself is still correct). Override to False when the model
+        # doesn't actually consume num_items_in_batch.
+        if self.model_accepts_loss_kwargs:
+            model_to_check = self.accelerator.unwrap_model(self.model)
+            if hasattr(model_to_check, "base_model"):  # PEFT wrapper
+                model_to_check = model_to_check.base_model
+            if hasattr(model_to_check, "model"):
+                model_to_check = model_to_check.model
+            fwd = getattr(model_to_check, "forward", None)
+            if fwd is not None:
+                import inspect
+
+                params = inspect.signature(fwd).parameters
+                if "num_items_in_batch" not in params:
+                    self.model_accepts_loss_kwargs = False
+
         self.train_data_collator = self.data_collator
         self._stored_metrics = defaultdict(
             lambda: defaultdict(lambda: {"values": [], "reduction": "mean"})
@@ -381,6 +402,31 @@ class AxolotlTrainer(
             # Store per-step trainable tokens for throughput calculation
             self.state.tokens["trainable_tokens"] = trainable_tokens.detach().cpu()
 
+        # Gemma4 requires mm_token_type_ids during training (even for text-only).
+        # Inject zeros (= text token type) when not provided by the data collator.
+        # Use unwrap_model to handle DDP/FSDP wrappers that don't proxy .config.
+        _unwrapped = self.accelerator.unwrap_model(model)
+        _model_type = getattr(getattr(_unwrapped, "config", None), "model_type", None)
+        if (
+            "mm_token_type_ids" not in inputs
+            and "input_ids" in inputs
+            and _model_type == "gemma4"
+        ):
+            inputs["mm_token_type_ids"] = torch.zeros_like(inputs["input_ids"])
+
+        # Gemma4 (and Gemma3): transformers' masking_utils detects packed sequences
+        # from position_ids, but only when attention_mask is None.  When sample
+        # packing is active the collator provides an all-ones attention_mask that
+        # prevents this detection — remove it so the model builds the correct
+        # per-sequence causal masks.
+        if (
+            self.args.sample_packing
+            and _model_type in ("gemma4", "gemma3")
+            and "attention_mask" in inputs
+            and "position_ids" in inputs
+        ):
+            del inputs["attention_mask"]
+
         if self.args.orpo_alpha:
             return self.orpo_compute_loss(
                 model,
@@ -388,6 +434,23 @@ class AxolotlTrainer(
                 return_outputs=return_outputs,
                 num_items_in_batch=num_items_in_batch,
             )
+
+        # Gemma4ForConditionalGeneration computes loss with a manual
+        # nn.CrossEntropyLoss() that bypasses proper num_items_in_batch
+        # normalization and does redundant attention_mask filtering.
+        # Compute loss externally using the standard loss_function instead.
+        if _model_type == "gemma4" and "labels" in inputs:
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs.logits
+            unwrapped = self.accelerator.unwrap_model(model)
+            vocab_size = unwrapped.config.get_text_config().vocab_size
+            loss = unwrapped.loss_function(
+                logits, labels, vocab_size, num_items_in_batch=num_items_in_batch
+            )
+            if return_outputs:
+                return loss, outputs
+            return loss
 
         return super().compute_loss(
             model,
@@ -400,6 +463,21 @@ class AxolotlTrainer(
     def evaluate(self, *args, **kwargs):
         LOG.info("Running evaluation step...")
         return super().evaluate(*args, **kwargs)
+
+    @override
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Gemma4 requires mm_token_type_ids even during evaluation.
+        _unwrapped = self.accelerator.unwrap_model(model)
+        _model_type = getattr(getattr(_unwrapped, "config", None), "model_type", None)
+        if (
+            "mm_token_type_ids" not in inputs
+            and "input_ids" in inputs
+            and _model_type == "gemma4"
+        ):
+            inputs["mm_token_type_ids"] = torch.zeros_like(inputs["input_ids"])
+        return super().prediction_step(
+            model, inputs, prediction_loss_only, ignore_keys=ignore_keys
+        )
 
     @staticmethod
     def orpo_concatenate_inputs(inputs, label_pad_token=-100, pad_token=0, device=None):
@@ -508,12 +586,24 @@ class AxolotlTrainer(
         )
 
         # Perform a single forward pass
+        forward_kwargs = {
+            "input_ids": concat_inputs["input_ids"],
+            "attention_mask": concat_inputs["attention_mask"],
+            "labels": concat_inputs["labels"],
+        }
+        # Gemma4 requires mm_token_type_ids during training (even for text-only)
+        if (
+            getattr(getattr(model, "config", None), "model_type", None) == "gemma4"
+            and "mm_token_type_ids" not in concat_inputs
+        ):
+            forward_kwargs["mm_token_type_ids"] = torch.zeros_like(
+                concat_inputs["input_ids"]
+            )
+        elif "mm_token_type_ids" in concat_inputs:
+            forward_kwargs["mm_token_type_ids"] = concat_inputs["mm_token_type_ids"]
+
         outputs = model(
-            **{
-                "input_ids": concat_inputs["input_ids"],
-                "attention_mask": concat_inputs["attention_mask"],
-                "labels": concat_inputs["labels"],
-            },
+            **forward_kwargs,
             output_hidden_states=True,
         )
 
