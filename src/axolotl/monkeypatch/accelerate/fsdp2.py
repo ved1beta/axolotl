@@ -179,8 +179,7 @@ def get_state_dict(self, model, unwrap=True):
             torch.distributed.barrier()
 
         # Release the sharded view and force the allocator to give back the
-        # gather buffers. Together with the empty_cache in
-        # AxolotlTrainer._save_checkpoint, this is the fix for #3596.
+        # gather buffers.
         del sharded_state_dict
         gc.collect()
         if torch.cuda.is_available():
