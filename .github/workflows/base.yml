@@ -6,11 +6,13 @@ on:
       - "main"
     paths:
       - 'docker/Dockerfile-base'
+      - 'docker/Dockerfile-base-blackwell'
       - 'docker/Dockerfile-uv-base'
       - '.github/workflows/base.yml'
   pull_request:
     paths:
       - 'docker/Dockerfile-base'
+      - 'docker/Dockerfile-base-blackwell'
       - 'docker/Dockerfile-uv-base'
       - '.github/workflows/base.yml'
   workflow_dispatch:
@@ -86,6 +88,17 @@ jobs:
             torch_cuda_arch_list: "9.0+PTX"
             dockerfile: "Dockerfile-base"
             platforms: "linux/amd64,linux/arm64"
+          # Blackwell-targeted base: SM100 (B100/B200), SM103 (B300),
+          # SM120 (RTX 50-series). SM90 retained so the same image runs on Hopper.
+          - cuda: "130"
+            cuda_version: 13.0.0
+            cudnn_version: ""
+            python_version: "3.11"
+            pytorch: 2.9.1
+            torch_cuda_arch_list: "9.0 10.0 10.3 12.0+PTX"
+            dockerfile: "Dockerfile-base-blackwell"
+            platforms: "linux/amd64,linux/arm64"
+            axolotl_extras: "blackwell"
 #          - cuda: "128"
 #            cuda_version: 12.8.1
 #            cudnn_version: ""
