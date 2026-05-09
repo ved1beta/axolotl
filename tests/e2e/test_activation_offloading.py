@@ -79,9 +79,7 @@ class TestActivationOffloading:
         from axolotl.core.trainers.mixins import activation_checkpointing as ac_mod
 
         recorded_states: list[dict] = []
-        original_training_step = (
-            ac_mod.ActivationOffloadingMixin.training_step
-        )
+        original_training_step = ac_mod.ActivationOffloadingMixin.training_step
 
         def recording_training_step(self, *args, **kwargs):
             ctx = self.activation_offload_context
@@ -92,9 +90,7 @@ class TestActivationOffloading:
                         "tracker": len(ctx.tracker),
                         "storage_dedup": len(ctx.storage_to_tensor_id),
                         "fwd_stash": len(getattr(ctx, "fwd_stash", {})),
-                        "bwd_tensor_stash": len(
-                            getattr(ctx, "bwd_tensor_stash", {})
-                        ),
+                        "bwd_tensor_stash": len(getattr(ctx, "bwd_tensor_stash", {})),
                         "bwd_ev_stash": len(getattr(ctx, "bwd_ev_stash", {})),
                     }
                 )
