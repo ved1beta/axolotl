@@ -240,8 +240,28 @@ class ReLoRAConfig(BaseModel):
     )
     relora_prune_ratio: float | None = Field(
         default=None,
+        ge=0.0,
+        le=1.0,
         json_schema_extra={
-            "description": "threshold for optimizer magnitude when pruning"
+            "description": (
+                "Fraction of optimizer state values to zero on each ReLoRA restart. "
+                "When relora_prune_method='reset' and this is omitted, defaults to "
+                "0.999 (paper-style near-full reset). For other methods, defaults to 0.9."
+            )
+        },
+    )
+    relora_prune_method: Literal["magnitude", "random", "reset"] | None = Field(
+        default="magnitude",
+        json_schema_extra={
+            "description": (
+                "Optimizer state pruning method on each ReLoRA restart. "
+                "'magnitude' (default) keeps top-k by absolute value; "
+                "'random' keeps a random subset at relora_prune_ratio; "
+                "'reset' uses near-full random pruning (default ratio 0.999, "
+                "honoring relora_prune_ratio when explicitly set). "
+                "Paper-style recipe: relora_prune_method='reset' with no "
+                "relora_prune_ratio, equivalent to 'random' with ratio=0.999."
+            )
         },
     )
     relora_cpu_offload: bool | None = Field(
