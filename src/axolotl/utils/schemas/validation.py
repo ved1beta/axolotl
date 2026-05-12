@@ -1478,8 +1478,19 @@ class ComplexValidationMixin:
         if self.relora:
             if not self.jagged_restart_steps:
                 raise ValueError("jagged_restart_steps must be set to use ReLoRA")
-            if self.adapter not in ("lora", "qlora"):
-                raise ValueError("cfg.adapter must be lora or qlora to use ReLoRA")
+
+            adapter_supports_relora = self.adapter in ("lora", "qlora")
+            if self.adapter and not adapter_supports_relora:
+                from axolotl.integrations.base import PluginManager
+
+                plugin_manager = PluginManager.get_instance()
+                adapter_supports_relora = plugin_manager.adapter_supports_relora(
+                    self.adapter
+                )
+            if not adapter_supports_relora:
+                raise ValueError(
+                    "cfg.adapter must support ReLoRA to use ReLoRA restart semantics"
+                )
 
             if self.fsdp or self.fsdp_config:
                 raise ValueError("fsdp not supported with ReLoRA")

@@ -38,10 +38,10 @@ class LoraConfig(BaseModel):
         default=False, json_schema_extra={"description": "Use bitsandbytes 4 bit"}
     )
 
-    adapter: Literal["lora", "qlora", "llama-adapter"] | None = Field(
+    adapter: str | None = Field(
         default=None,
         json_schema_extra={
-            "description": "If you want to use 'lora', 'qlora', or 'llama-adapter', or leave blank to train all parameters in original model"
+            "description": "If you want to use a built-in or plugin adapter, or leave blank to train all parameters in original model"
         },
     )
     lora_model_dir: str | None = Field(
@@ -174,6 +174,16 @@ class LoraConfig(BaseModel):
                 "load_in_8bit and load_in_4bit are not supported without setting an adapter for training."
                 "If you want to full finetune, please turn off load_in_8bit and load_in_4bit."
             )
+        adapter = data.get("adapter")
+        if adapter and adapter not in ("lora", "qlora", "llama-adapter"):
+            from axolotl.integrations.base import PluginManager
+
+            plugin_manager = PluginManager.get_instance()
+            if not plugin_manager.supports_adapter(adapter):
+                raise ValueError(
+                    f"Adapter '{adapter}' is not built in and was not registered by "
+                    "a plugin. Add the plugin that provides this adapter to `plugins:`."
+                )
         return data
 
     @model_validator(mode="after")
