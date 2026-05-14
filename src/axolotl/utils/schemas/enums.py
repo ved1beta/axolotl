@@ -90,6 +90,7 @@ class CustomSupportedOptimizers(str, Enum):
     came_pytorch = "came_pytorch"
     muon = "muon"
     dion = "dion"
+    q_galore_adamw8bit = "q_galore_adamw8bit"
     flash_adamw = "flash_adamw"
     flash_adam = "flash_adam"
     flash_sgd = "flash_sgd"
