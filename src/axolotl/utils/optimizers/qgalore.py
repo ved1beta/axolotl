@@ -12,11 +12,58 @@ The companion INT8-weight-wrapping recipe from the paper is not yet wired up
 
 from __future__ import annotations
 
+import inspect
+import types
+
 from torch import nn
 
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
+
+
+def patch_q_galore_for_modern_bnb() -> None:
+    """Adapt ``q-galore-torch==1.0`` to ``bitsandbytes>=0.44``.
+
+    bnb 0.44 inserted ``beta3`` and ``alpha`` as positional arguments in
+    ``optimizer_update_8bit_blockwise`` and ``optimizer_update_32bit`` to
+    support AdEMAMix-style optimizers. The pinned q-galore-torch wheel still
+    calls the pre-0.44 layout, which fails with ``TypeError: missing 1
+    required positional argument: 'absmax2'``. We swap ``q_galore_torch``'s
+    bnb handle for a SimpleNamespace whose two affected functions accept the
+    legacy positional layout and re-emit the modern one.
+    """
+    import bitsandbytes.functional as bnb_F
+    import q_galore_torch.q_galore_adamw8bit as q_galore_mod
+
+    if "beta3" not in inspect.signature(bnb_F.optimizer_update_8bit_blockwise).parameters:
+        return  # old bnb — upstream call is already correct
+
+    if getattr(q_galore_mod.F, "_axolotl_qgalore_shim", False):
+        return  # already patched
+
+    real_blockwise = bnb_F.optimizer_update_8bit_blockwise
+    real_32bit = bnb_F.optimizer_update_32bit
+
+    def shim_blockwise(*args, **kwargs):
+        # legacy positional count = 15; new layout adds beta3, alpha after beta2.
+        if len(args) == 15:
+            args = args[:7] + (0.0, 0.0) + args[7:]
+        return real_blockwise(*args, **kwargs)
+
+    def shim_32bit(*args, **kwargs):
+        # legacy positional count = 13; new layout adds beta3, alpha after beta2.
+        if len(args) == 13:
+            args = args[:10] + (0.0, 0.0) + args[10:]
+        return real_32bit(*args, **kwargs)
+
+    shim = types.SimpleNamespace(
+        **{name: getattr(bnb_F, name) for name in dir(bnb_F) if not name.startswith("_")}
+    )
+    shim.optimizer_update_8bit_blockwise = shim_blockwise
+    shim.optimizer_update_32bit = shim_32bit
+    shim._axolotl_qgalore_shim = True
+    q_galore_mod.F = shim
 
 
 def _name_matches(name: str, patterns: list[str]) -> bool:
