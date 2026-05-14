@@ -249,7 +249,7 @@ conflicts = [
     ],
 ]
 
-[tool.uv.extra-build-dependencies]
+[tool.uv.extra-build-dependencies
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
