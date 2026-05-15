@@ -323,6 +323,19 @@ def patch_self_attn_lora(cfg: DictDefault):
         LOG.info(f"{attention_cls.__name__} already patched")
         return
 
+    # Some model-specific monkeypatches (e.g. Gemma4 fused RMSNorm+RoPE) replace
+    # ``forward`` wholesale with an implementation that already routes through
+    # ``self.apply_qkv``/``self.apply_o`` when present. In that case the
+    # source-rewrite below would fail to find the original QKV pattern, and is
+    # also unnecessary — the instance-level method swaps in
+    # ``apply_lora_kernel_patches`` are sufficient.
+    if getattr(attention_cls, "_axolotl_supports_lora_kernels", False):
+        LOG.info(
+            f"{attention_cls.__name__} already supports apply_qkv/apply_o via "
+            "model-specific patch - skipping source rewrite"
+        )
+        return
+
     self_attn_forward = inspect.getsource(attention_cls.forward)
     attention_cls._original_forward = self_attn_forward
     self_attn_forward, _ = detab_code(self_attn_forward)

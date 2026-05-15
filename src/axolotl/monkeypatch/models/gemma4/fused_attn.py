@@ -145,7 +145,11 @@ def _make_fused_forward(original_forward):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        # Use apply_o if present (LoRA O kernel patch), otherwise direct proj
+        if hasattr(self, "apply_o"):
+            attn_output = self.apply_o(attn_output)
+        else:
+            attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
     return fused_forward
@@ -183,6 +187,10 @@ def patch_gemma4_fused_attn(install_shared_kv_workaround: bool = False):
 
     original_forward = Gemma4TextAttention.forward
     Gemma4TextAttention.forward = _make_fused_forward(original_forward)
+    # Signal to lora_kernels.patch_self_attn_lora that the source-rewrite for
+    # apply_qkv/apply_o is unnecessary: fused_forward already routes through
+    # them when present on the attention instance.
+    Gemma4TextAttention._axolotl_supports_lora_kernels = True
 
     if install_shared_kv_workaround:
         _patch_decoder_layer_call()
