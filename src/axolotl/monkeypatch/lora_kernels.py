@@ -76,11 +76,8 @@ QKV_PATCHES = [
     value_states = value_states.view(hidden_shape).transpose(1, 2)
 """.lstrip("\n"),
     ),
-    # NOTE: Gemma4 intentionally has no QKV_PATCHES entry. It always runs
-    # through the fused attention monkeypatch (patch_gemma4_fused_attn),
-    # whose hand-written forward already calls self.apply_qkv/self.apply_o.
-    # patch_self_attn_lora skips Gemma4 by class, so a source-rewrite pattern
-    # here would be permanently dead. See that skip for the rationale.
+    # Gemma4 has no entry: its fused forward already calls apply_qkv/apply_o,
+    # and patch_self_attn_lora skips it (see the skip there).
 ]
 
 ORIGINAL_O_CODE = """
@@ -249,13 +246,9 @@ def patch_self_attn_lora(cfg: DictDefault):
         LOG.info(f"{attention_cls.__name__} already patched")
         return
 
-    # Gemma4 always runs through the fused RMSNorm+RoPE monkeypatch
-    # (``patch_gemma4_fused_attn``, applied unconditionally for gemma4 models
-    # in patch_manager). Its hand-written ``forward`` already routes through
-    # ``self.apply_qkv``/``self.apply_o`` when present, so the source-rewrite
-    # below is both impossible (the original QKV source is gone) and
-    # unnecessary. Gemma4 therefore has exactly one LoRA-kernel path — the
-    # fused one — and intentionally no QKV_PATCHES entry.
+    # Skip Gemma4: patch_manager applies patch_gemma4_fused_attn
+    # unconditionally for gemma4 before this runs, and that fused forward
+    # already calls apply_qkv/apply_o, so the source rewrite is dead.
     try:
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4TextAttention,
