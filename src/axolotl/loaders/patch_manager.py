@@ -93,8 +93,10 @@ class PatchManager:
         return importlib.util.find_spec("flash_attn") is not None
 
     def _maybe_disable_qwen3_5_compile_lora_kernels(self):
+        from axolotl.monkeypatch.models.gated_delta_net_ops import GDN_MODEL_TYPES
+
         if (
-            self.cfg.model_config_type in ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+            self.cfg.model_config_type in GDN_MODEL_TYPES
             and self.cfg.sample_packing
             and self.cfg.torch_compile
             and self.cfg.adapter

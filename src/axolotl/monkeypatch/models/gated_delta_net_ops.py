@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["fla_ops_available", "fla_ops_build_error"]
+__all__ = ["GDN_MODEL_TYPES", "fla_ops_available", "fla_ops_build_error"]
+
+GDN_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
 
 _OPS_BUILT = False
 _OPS_BUILD_ERROR: str | None = None
