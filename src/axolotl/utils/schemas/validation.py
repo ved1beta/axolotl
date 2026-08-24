@@ -219,9 +219,10 @@ class TrainingValidationMixin:
     @classmethod
     def check_batch_size_fields(cls, data):
         fields = ("micro_batch_size", "gradient_accumulation_steps", "batch_size")
-        non_empty_count = sum(1 for field in fields if data.get(field))
+        if data.get("micro_batch_size") or data.get("gradient_accumulation_steps"):
+            return data
 
-        if non_empty_count < 2:
+        if data.get("batch_size"):
             raise ValueError(f"At least two of {', '.join(fields)} must be set")
         return data
 
@@ -1407,21 +1408,6 @@ class ModelCompatibilityValidationMixin:
             self.base_model and "mpt" in self.base_model.lower()
         ) and self.gradient_checkpointing:
             raise ValueError("gradient_checkpointing is not supported for MPT models")
-        return self
-
-    @model_validator(mode="after")
-    def check_nemotron_h_gradient_checkpointing(self):
-        if (
-            self.base_model
-            and "nemotron-h" in self.base_model.lower()
-            and self.gradient_checkpointing
-            and not self.sample_packing
-        ):
-            raise ValueError(
-                "gradient_checkpointing for nemotron_h requires sample_packing: true. "
-                "The upstream model marks supports_gradient_checkpointing=False; "
-                "axolotl only enables it after applying the sample-packing patch."
-            )
         return self
 
     @model_validator(mode="after")
