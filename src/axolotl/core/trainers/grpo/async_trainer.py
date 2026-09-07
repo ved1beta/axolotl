@@ -88,11 +88,6 @@ try:
 except ImportError:
     _fused_selective_log_softmax = None
 
-from axolotl.core.trainers.grpo.scope import (
-    scope_aux_indices,
-    scope_temperature,
-    scope_weights,
-)
 from axolotl.utils.logging import get_logger
 
 # ---------------------------------------------------------------------------
@@ -187,41 +182,6 @@ class AsyncGRPOConfig(GRPOConfig):
     use_bias_correction_kl: bool = field(
         default=False,
         metadata={"help": "Apply IS correction to KL divergence term."},
-    )
-
-    # --- SCOPE-RL (arXiv:2510.08141) ---
-    scope_rl: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable SCOPE-RL: a small extra branch of temperature-adjusted positive samples that "
-            "keeps policy entropy near scope_target_entropy instead of collapsing."
-        },
-    )
-    scope_target_entropy: float = field(
-        default=0.5,
-        metadata={
-            "help": "Target policy entropy H0 the auxiliary temperature steers toward."
-        },
-    )
-    scope_alpha: float = field(
-        default=1 / 64,
-        metadata={
-            "help": "Fraction of rollout groups resampled for the auxiliary branch, and the weight of its loss term."
-        },
-    )
-    scope_temperature_min: float = field(
-        default=0.8,
-        metadata={"help": "Lower clip for the auxiliary sampling temperature."},
-    )
-    scope_temperature_max: float = field(
-        default=1.2,
-        metadata={"help": "Upper clip for the auxiliary sampling temperature."},
-    )
-    scope_positive_threshold: float = field(
-        default=1.0,
-        metadata={
-            "help": "Total reward at or above which an auxiliary sample counts as positive."
-        },
     )
 
 
@@ -867,15 +827,8 @@ class AsyncGRPOTrainer(GRPOTrainer):
             if not hasattr(self, attr):
                 setattr(self, attr, getattr(self.args, cfg_key, default))
 
-        if self.args.scope_rl and self.args.streaming_partial_batch:
-            raise ValueError("scope_rl is not supported with streaming_partial_batch.")
-        if self.args.scope_rl and not self.use_vllm:
-            raise ValueError("scope_rl requires vLLM generation.")
-        if self.args.scope_rl and not self.args.async_prefetch:
-            raise ValueError("scope_rl requires async_prefetch.")
-        # Seeded at the target so the first auxiliary rollout runs at T = 1.0.
-        self._scope_entropy = self.args.scope_target_entropy
-        self._scope_temp_lock = threading.Lock()
+        # Gathered mean policy entropy of the latest optimizer step, for rollout hooks.
+        self._last_entropy: float | None = None
 
         # Async state
         self._async_queue: queue.Queue | None = None
@@ -1509,32 +1462,15 @@ class AsyncGRPOTrainer(GRPOTrainer):
             extra_fields,
         )
 
-    def _scope_generate(self, prompts, rank0_only):
-        """Generate the SCOPE-RL auxiliary branch at an entropy-adjusted temperature.
+    def _generate_auxiliary(self, inputs, prompts, images, rank0_only):
+        """Hook for an extra rollout branch appended after the main rows.
 
-        The temperature is relative to the policy, so it is applied on top of the
-        configured sampling temperature (identical to the paper when that is 1.0).
-        Only the generation backend is retuned: ``self.temperature`` also scales
-        logits on the training thread, which runs concurrently with this call.
+        Returns ``(aux_inputs, aux_prompts, generation)`` where ``generation`` is
+        the tuple returned by ``_generate`` / ``_generate_rank0_only`` for
+        ``aux_prompts``, or ``([], [], None)`` to add nothing. Appended rows are
+        flagged in the rollout's ``aux_mask``.
         """
-        scale = scope_temperature(
-            self._scope_entropy,
-            self.args.scope_target_entropy,
-            self.args.scope_temperature_min,
-            self.args.scope_temperature_max,
-        )
-        self._metrics["train"]["scope/temperature"].append(scale)
-
-        generation = self.vllm_generation
-        with self._scope_temp_lock:
-            previous = generation.temperature
-            generation.temperature = previous * scale
-            try:
-                if rank0_only:
-                    return self._generate_rank0_only(prompts)
-                return self._generate(prompts)
-            finally:
-                generation.temperature = previous
+        return [], [], None
 
     def _generate_only(self, inputs, rank0_only=False):
         """Generate completions without scoring.  Runs on background thread.
@@ -1576,22 +1512,6 @@ class AsyncGRPOTrainer(GRPOTrainer):
                 for p, il in zip(prompts, images, strict=True)
             ]
 
-        # --- SCOPE-RL: pick the groups to resample in the auxiliary branch ---
-        if self.args.scope_rl and images is not None:
-            logger.warning_once("scope_rl is skipped for multimodal batches.")
-        scope_idx = (
-            scope_aux_indices(
-                len(inputs),
-                self.num_generations,
-                self.args.scope_alpha,
-                self.state.global_step,
-            )
-            if self.args.scope_rl and images is None
-            else []
-        )
-        scope_inputs = [inputs[i] for i in scope_idx]
-        scope_prompts = [prompts[i] for i in scope_idx]
-
         # --- Generate completions ---
         # rank0_only (FSDP mode) calls vLLM directly without cross-rank collectives.
         generate = self._generate_rank0_only if rank0_only else self._generate
@@ -1605,8 +1525,8 @@ class AsyncGRPOTrainer(GRPOTrainer):
             extra_fields,
         ) = generate(prompts)
 
-        scope_output = (
-            self._scope_generate(scope_prompts, rank0_only) if scope_idx else None
+        aux_inputs, aux_prompts, aux_output = self._generate_auxiliary(
+            inputs, prompts, images, rank0_only
         )
 
         if not rank0_only and self.accelerator.num_processes > 1:
@@ -1616,11 +1536,11 @@ class AsyncGRPOTrainer(GRPOTrainer):
 
             inputs = gather_object(inputs)
             prompts = [x["prompt"] for x in inputs]
-            scope_inputs = gather_object(scope_inputs)
-            scope_prompts = [x["prompt"] for x in scope_inputs]
+            aux_inputs = gather_object(aux_inputs)
+            aux_prompts = [x["prompt"] for x in aux_inputs]
 
-        num_scope = 0
-        if scope_output is not None:
+        num_aux = 0
+        if aux_output is not None:
             (
                 aux_prompt_ids,
                 aux_completion_ids,
@@ -1629,10 +1549,10 @@ class AsyncGRPOTrainer(GRPOTrainer):
                 aux_num_items,
                 aux_sampling_logps,
                 _,
-            ) = scope_output
-            num_scope = len(aux_completion_ids)
-            inputs = inputs + scope_inputs
-            prompts = prompts + scope_prompts
+            ) = aux_output
+            num_aux = len(aux_completion_ids)
+            inputs = inputs + aux_inputs
+            prompts = prompts + aux_prompts
             prompt_ids_list = prompt_ids_list + aux_prompt_ids
             completion_ids_list = completion_ids_list + aux_completion_ids
             completions = completions + aux_completions
@@ -1752,10 +1672,10 @@ class AsyncGRPOTrainer(GRPOTrainer):
             "_deferred_completion_ids_list": completion_ids_list,
             "_rank0_only": rank0_only,
         }
-        if num_scope:
-            scope_mask = torch.zeros(completion_ids.size(0), device=device)
-            scope_mask[-num_scope:] = 1.0
-            output["scope_mask"] = scope_mask
+        if num_aux:
+            aux_mask = torch.zeros(completion_ids.size(0), device=device)
+            aux_mask[-num_aux:] = 1.0
+            output["aux_mask"] = aux_mask
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
         if tool_mask is not None:
@@ -1819,8 +1739,14 @@ class AsyncGRPOTrainer(GRPOTrainer):
         s_start: int | None = None,
         s_end: int | None = None,
         is_last_chunk: bool = True,
+        rewards: torch.Tensor | None = None,
+        process_slice: slice | None = None,
     ) -> None:
-        """Called after advantages are computed. Override for replay buffer, re-roll, etc."""
+        """Called after advantages are computed. Override for replay buffer, re-roll, etc.
+
+        ``rewards`` are the weighted per-row rewards for the whole gathered batch and
+        ``process_slice`` selects this rank's rows from it (deferred scoring only).
+        """
 
     def _notify_rollouts_scored(
         self,
@@ -2084,27 +2010,6 @@ class AsyncGRPOTrainer(GRPOTrainer):
         advantages = advantages[process_slice]
         data["advantages"] = advantages
 
-        # --- SCOPE-RL: auxiliary rows keep positives only, at advantage 1 (Eq. 11) ---
-        if "scope_mask" in data:
-            scope_mask = data["scope_mask"]
-            positive = (rewards >= self.args.scope_positive_threshold).float()
-            if scope_mask.size(0) == all_advantages.size(0):
-                scope_mask = scope_mask[process_slice]
-                positive = positive[process_slice]
-            data["scope_mask"] = scope_mask
-            data["scope_weight"] = scope_weights(scope_mask, self.args.scope_alpha)
-            data["advantages"] = torch.where(scope_mask.bool(), positive, advantages)
-            if "importance_sampling_ratio" in data:
-                # Auxiliary rows come from the temperature-scaled policy by design,
-                # so the vLLM/policy mismatch correction does not apply to them.
-                is_ratio = data["importance_sampling_ratio"]
-                data["importance_sampling_ratio"] = torch.where(
-                    scope_mask.bool().unsqueeze(1), torch.ones_like(is_ratio), is_ratio
-                )
-            self._metrics[mode]["scope/positive_frac"].append(
-                ((positive * scope_mask).sum() / scope_mask.sum().clamp(min=1)).item()
-            )
-
         # --- Post-advantage hook (for replay buffer, re-roll, etc.) ---
         self._post_advantage_hook(
             data,
@@ -2113,6 +2018,8 @@ class AsyncGRPOTrainer(GRPOTrainer):
             inputs,
             num_generations,
             mode,
+            rewards=rewards,
+            process_slice=process_slice,
         )
 
         # --- Metrics ---
@@ -3166,6 +3073,14 @@ class AsyncGRPOTrainer(GRPOTrainer):
         is_low_kl = seq_kl <= off_policy_threshold
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)
 
+    def _weight_per_token_loss(self, per_token_loss, per_token_kl, inputs):
+        """Hook to reweight rows before masking and aggregation.
+
+        Returns ``(per_token_loss, per_token_kl)``; the returned KL term is what the
+        ``beta`` penalty adds to the loss, while the KL metric stays unweighted.
+        """
+        return per_token_loss, per_token_kl
+
     def _compute_loss(self, model, inputs):
         """Override to add IS ratio correction and off-policy sequence masking."""
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -3275,6 +3190,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
         coef_1 = torch.exp(log_importance_weights)
 
         # --- KL divergence ---
+        per_token_kl = None
         if self.beta != 0.0:
             ref_per_token_logps = inputs["ref_per_token_logps"]
             per_token_kl = (
@@ -3307,9 +3223,9 @@ class AsyncGRPOTrainer(GRPOTrainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-        # --- SCOPE-RL: fold the alpha-weighted auxiliary term into the row weights ---
-        if "scope_weight" in inputs:
-            per_token_loss = per_token_loss * inputs["scope_weight"].unsqueeze(1)
+        per_token_loss, per_token_kl_loss = self._weight_per_token_loss(
+            per_token_loss, per_token_kl, inputs
+        )
 
         # --- Apply masks ---
         if off_policy_mask is not None:
@@ -3326,12 +3242,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
-            kl = per_token_kl
-            if "scope_weight" in inputs:
-                kl = kl * (
-                    inputs["scope_weight"] * (1 - inputs["scope_mask"])
-                ).unsqueeze(1)
-            per_token_loss = per_token_loss + self.beta * kl
+            per_token_loss = per_token_loss + self.beta * per_token_kl_loss
 
         # --- Aggregate loss ---
         mode = "train" if self.model.training else "eval"
@@ -3381,8 +3292,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
             self.accelerator.gather(masked_batch_mean(entropies)).nanmean().item()
         )
         self._metrics[mode]["entropy"].append(mean_entropy)
-        if self.args.scope_rl:
-            self._scope_entropy = mean_entropy
+        self._last_entropy = mean_entropy
 
         if self.loss_type in ("grpo", "bnpo", "dr_grpo", "dapo", "luspo"):
             is_low = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)

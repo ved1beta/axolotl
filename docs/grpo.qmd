@@ -416,20 +416,24 @@ Work is sharded across workers by prompt group. For simple reward functions, a s
 
 ### SCOPE-RL entropy control
 
-GRPO entropy usually falls monotonically until the policy stops exploring. [SCOPE-RL](https://arxiv.org/abs/2510.08141) holds it at a target instead: each rollout resamples a small fraction of the prompt groups at an adjusted temperature, keeps only the completions that were rewarded, and adds them to the loss as a positive-advantage term.
+GRPO entropy usually falls monotonically until the policy stops exploring. [SCOPE-RL](https://arxiv.org/abs/2510.08141) holds it at a target instead: each rollout resamples a small fraction of the prompt groups at an adjusted temperature, keeps only the completions that were rewarded, and adds them to the loss as a positive-advantage term. It ships as a plugin:
 
 ```yaml
+plugins:
+  - axolotl.integrations.scope_rl.ScopeRLPlugin
+
 trl:
   use_data_producer: true
   async_prefetch: true            # required -- the auxiliary rollout runs only here
   loss_type: grpo                 # required -- TRL defaults to dapo, which is incompatible
-  scope_rl: true
-  scope_target_entropy: 0.5       # H0 -- the entropy level to hold
-  scope_alpha: 0.015625           # 1/64: share of groups resampled, and the weight of the term
-  scope_positive_threshold: 1.0   # total reward at which a sample counts as positive
+
+scope_rl: true
+scope_target_entropy: 0.5         # H0 -- the entropy level to hold
+scope_alpha: 0.015625             # 1/64: share of groups resampled, and the weight of the term
+scope_positive_threshold: 1.0     # total reward at which a sample counts as positive
 ```
 
-Both marked lines are required and rejected if missing. The auxiliary rollout is only issued on the prefetching producer's path, and the token-normalised loss types (`bnpo`, `cispo`, `dapo`, `luspo`) weight rows by completion length, which would pull the auxiliary term off `scope_alpha`.
+Both marked lines are required and rejected if missing. The plugin supplies its own trainer, so leave `trainer_cls` unset. See the [plugin reference](custom_integrations.qmd#scope-rl-entropy-control) for every option. The auxiliary rollout is only issued on the prefetching producer's path, and the token-normalised loss types (`bnpo`, `cispo`, `dapo`, `luspo`) weight rows by completion length, which would pull the auxiliary term off `scope_alpha`.
 
 The auxiliary temperature is `clip(1 + H0 - H, 0.8, 1.2)` times your sampling temperature, where `H` is the entropy measured on the previous step: below target it samples hotter (positive samples at high temperature push entropy back up), above target it samples colder. Only positive samples are kept -- the paper's ablations show that mixing in negatives re-collapses entropy.
 
