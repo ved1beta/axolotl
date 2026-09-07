@@ -827,6 +827,18 @@ class AsyncGRPOTrainer(GRPOTrainer):
             if not hasattr(self, attr):
                 setattr(self, attr, getattr(self.args, cfg_key, default))
 
+        # TRL moved these onto ``_tokenizer``; the rollout paths still read them here.
+        for _tok_attr in ("pad_token_id", "eos_token_id"):
+            if not hasattr(self, _tok_attr):
+                setattr(
+                    self,
+                    _tok_attr,
+                    getattr(
+                        getattr(self, "_tokenizer", None) or self.processing_class,
+                        _tok_attr,
+                    ),
+                )
+
         # Gathered mean policy entropy of the latest optimizer step, for rollout hooks.
         self._last_entropy: float | None = None
 
@@ -1514,16 +1526,31 @@ class AsyncGRPOTrainer(GRPOTrainer):
 
         # --- Generate completions ---
         # rank0_only (FSDP mode) calls vLLM directly without cross-rank collectives.
-        generate = self._generate_rank0_only if rank0_only else self._generate
-        (
-            prompt_ids_list,
-            completion_ids_list,
-            tool_mask_list,
-            completions,
-            num_items_in_batch,
-            sampling_per_token_logps_list,
-            extra_fields,
-        ) = generate(prompts)
+        if rank0_only:
+            (
+                prompt_ids_list,
+                completion_ids_list,
+                tool_mask_list,
+                completions,
+                num_items_in_batch,
+                sampling_per_token_logps_list,
+                extra_fields,
+            ) = self._generate_rank0_only(prompts)
+        else:
+            # TRL's _generate returns (prompt_ids, completion_ids, tool_mask,
+            # completions, logprobs, extra_fields, images, tool_images) and has no
+            # token count, so derive it the way _generate_rank0_only does.
+            (
+                prompt_ids_list,
+                completion_ids_list,
+                tool_mask_list,
+                completions,
+                sampling_per_token_logps_list,
+                extra_fields,
+                _,
+                _,
+            ) = self._generate(prompts)
+            num_items_in_batch = sum(len(ids) for ids in completion_ids_list)
 
         aux_inputs, aux_prompts, aux_output = self._generate_auxiliary(
             inputs, prompts, images, rank0_only
@@ -1541,15 +1568,29 @@ class AsyncGRPOTrainer(GRPOTrainer):
 
         num_aux = 0
         if aux_output is not None:
-            (
-                aux_prompt_ids,
-                aux_completion_ids,
-                aux_tool_mask,
-                aux_completions,
-                aux_num_items,
-                aux_sampling_logps,
-                _,
-            ) = aux_output
+            if rank0_only:
+                (
+                    aux_prompt_ids,
+                    aux_completion_ids,
+                    aux_tool_mask,
+                    aux_completions,
+                    aux_num_items,
+                    aux_sampling_logps,
+                    _,
+                ) = aux_output
+            else:
+                # TRL's _generate return shape, as in the main branch above.
+                (
+                    aux_prompt_ids,
+                    aux_completion_ids,
+                    aux_tool_mask,
+                    aux_completions,
+                    aux_sampling_logps,
+                    _,
+                    _,
+                    _,
+                ) = aux_output
+                aux_num_items = sum(len(ids) for ids in aux_completion_ids)
             num_aux = len(aux_completion_ids)
             inputs = inputs + aux_inputs
             prompts = prompts + aux_prompts
@@ -1851,7 +1892,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         prompt_mask=prompt_mask,
                     )
                 else:
-                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                         self.model,
                         prompt_completion_ids,
                         attention_mask,
@@ -1867,7 +1908,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
             # Reference model logprobs
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_logps, _ = self._get_per_token_logps_and_entropies(
+                    ref_logps, _, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
                         attention_mask,
@@ -1885,7 +1926,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         else None
                     )
                     with use_adapter(unwrapped, adapter_name=adapter_name):
-                        ref_logps, _ = self._get_per_token_logps_and_entropies(
+                        ref_logps, _, _ = self._get_per_token_logps_and_entropies(
                             self.model,
                             prompt_completion_ids,
                             attention_mask,
@@ -2246,7 +2287,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         prompt_mask=chunk_prompt_mask,
                     )
                 else:
-                    old_logps, _ = self._get_per_token_logps_and_entropies(
+                    old_logps, _, _ = self._get_per_token_logps_and_entropies(
                         self.model,
                         prompt_completion_ids,
                         attention_mask,
@@ -2296,7 +2337,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
             # Reference logprobs
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_logps, _ = self._get_per_token_logps_and_entropies(
+                    ref_logps, _, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
                         attention_mask,
@@ -2314,7 +2355,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         else None
                     )
                     with use_adapter(unwrapped, adapter_name=adapter_name):
-                        ref_logps, _ = self._get_per_token_logps_and_entropies(
+                        ref_logps, _, _ = self._get_per_token_logps_and_entropies(
                             self.model,
                             prompt_completion_ids,
                             attention_mask,
@@ -2927,14 +2968,18 @@ class AsyncGRPOTrainer(GRPOTrainer):
         logits_to_keep,
         batch_size=None,
         compute_entropy=False,
+        compute_aux_loss=False,
         pixel_values=None,
         image_grid_thw=None,
         num_images=None,
         pixel_attention_mask=None,
+        spatial_shapes=None,
+        num_tiles=None,
         image_sizes=None,
         token_type_ids=None,
         mm_token_type_ids=None,
-    ) -> tuple[Any, torch.Tensor | None]:
+        **kwargs,
+    ) -> tuple[Any, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token.
 
         When running under no_grad (scoring path), bypasses accelerate's
@@ -3050,7 +3095,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
-        return logps, entropies
+        return logps, entropies, None
 
     # ------------------------------------------------------------------
     # Loss override (adds IS ratio + OPSM)
@@ -3130,7 +3175,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                 )
             )
         else:
-            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            per_token_logps, entropies, _ = self._get_per_token_logps_and_entropies(
                 model,
                 input_ids,
                 attention_mask,
