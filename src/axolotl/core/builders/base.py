@@ -311,6 +311,7 @@ class TrainerBuilderBase(abc.ABC):
             if training_args_kwargs.get("adam_epsilon"):
                 adam_kwargs["eps"] = training_args_kwargs.get("adam_epsilon")
 
+            optimizer_cls: Any
             if self.cfg.optimizer in ("muon", "muon_8bit"):
                 _, device_mesh = build_parallelism_config(self.cfg)
 
