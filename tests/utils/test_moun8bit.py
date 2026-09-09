@@ -71,7 +71,6 @@ def _state_bytes(opt: torch.optim.Optimizer, ndim_at_least: int = 0) -> int:
     return total
 
 
-
 @pytest.mark.parametrize(
     "shape",
     [
@@ -132,7 +131,6 @@ def test_blocks_are_scaled_independently():
     q_plain, _ = quantize(m)
     q_spiked, _ = quantize(spiked)
     assert torch.equal(q_plain[:, :BLOCK_SIZE], q_spiked[:, :BLOCK_SIZE])
-
 
 
 def test_muon_momentum_is_int8_between_steps():
@@ -216,7 +214,6 @@ def test_muon_state_is_smaller_than_dist_muon():
         quantized, ndim_at_least=2
     )
     assert ratio > 3.5, f"fp32 momentum should shrink ~4x, got {ratio:.2f}x"
-
 
 
 def test_first_step_matches_dist_muon_exactly():
@@ -310,7 +307,6 @@ def test_state_dict_roundtrip_resumes_identically():
 
     for want, got in zip(expected, resumed_model.parameters(), strict=True):
         assert torch.equal(want, got)
-
 
 
 def test_factory_reuses_dist_muon_param_grouping():
