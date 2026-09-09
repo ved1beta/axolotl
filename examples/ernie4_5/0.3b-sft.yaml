@@ -1,7 +1,5 @@
 base_model: baidu/ERNIE-4.5-0.3B-PT
-# Dense ERNIE 4.5 (model_type ernie4_5, Llama-style decoder). The MoE variant
-# (ernie4_5_moe, e.g. ERNIE-4.5-21B-A3B) is supported by the multipack patch but
-# is not covered by this example.
+# Dense ERNIE 4.5 (model_type ernie4_5, Llama-style decoder).
 
 datasets:
   - path: mlabonne/FineTome-100k
