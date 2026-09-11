@@ -128,13 +128,12 @@ class ExportCliArgs:
             "help": "Checkpoint to export. Defaults to the merged/trained output dir."
         },
     )
-    output_dir: Optional[str] = field(
+    outfile: Optional[str] = field(
         default=None,
-        metadata={"help": "Where to write exported files. Default: {output_dir}/gguf."},
+        metadata={"help": "Output path; {ftype} is replaced by each weight type."},
     )
     outtype: Optional[str] = field(
-        default=None,
-        metadata={"help": "Weight type of the unquantized GGUF conversion."},
+        default=None, metadata={"help": "Weight type of the GGUF conversion."}
     )
     quantize: Optional[str] = field(
         default=None,

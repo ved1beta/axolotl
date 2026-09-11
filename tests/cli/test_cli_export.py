@@ -106,9 +106,11 @@ class TestDoExport:
     def test_defaults(self, run_export, tmp_path):
         args, kwargs = run_export()
 
-        assert args == (tmp_path / "run", tmp_path / "run" / "gguf")
+        assert args == (
+            tmp_path / "run",
+            str(tmp_path / "run" / "gguf" / "run-{ftype}.gguf"),
+        )
         assert kwargs == {
-            "name": "run",
             "outtype": "f16",
             "quantize": [],
             "llama_cpp_dir": None,
@@ -119,12 +121,12 @@ class TestDoExport:
             {
                 "outtype": "bf16",
                 "quantize": ["q4_k_m"],
-                "output_dir": str(tmp_path / "ggufs"),
+                "outfile": str(tmp_path / "ggufs" / "{ftype}.gguf"),
                 "llama_cpp_dir": "/opt/llama.cpp",
             }
         )
 
-        assert args[1] == tmp_path / "ggufs"
+        assert args[1] == str(tmp_path / "ggufs" / "{ftype}.gguf")
         assert kwargs["outtype"] == "bf16"
         assert kwargs["quantize"] == ["Q4_K_M"]
         assert kwargs["llama_cpp_dir"] == "/opt/llama.cpp"

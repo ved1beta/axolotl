@@ -1686,7 +1686,7 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         ("--export.outtype",),
         "export__outtype",
         None,
-        "Weight type of the unquantized GGUF conversion.",
+        "Weight type of the GGUF conversion.",
     ),
     (
         ("--export.quantize",),
@@ -1695,10 +1695,10 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "llama.cpp quant types to additionally emit, e.g. ['Q4_K_M', 'Q8_0'].",
     ),
     (
-        ("--export.output-dir",),
-        "export__output_dir",
+        ("--export.outfile",),
+        "export__outfile",
         "str",
-        "Where to write exported files. Default: {output_dir}/gguf.",
+        "Output path; `{ftype}` is replaced by each weight type. Default: {output_dir}/gguf/{run}-{ftype}.gguf",
     ),
     (
         ("--export.llama-cpp-dir",),

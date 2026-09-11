@@ -147,9 +147,8 @@ def _run(cmd: list[str], output: Path) -> None:
 
 def export_gguf(
     model_dir: str | Path,
-    output_dir: str | Path,
+    outfile: str,
     *,
-    name: str | None = None,
     outtype: str = "f16",
     quantize: Sequence[str] = (),
     llama_cpp_dir: str | Path | None = None,
@@ -157,21 +156,22 @@ def export_gguf(
     """
     Convert a HuggingFace checkpoint to GGUF, plus one file per requested quant type.
 
+    `{ftype}` in `outfile` is replaced by each weight type, as in llama.cpp.
+
     Returns:
         Paths of the written GGUF files, unquantized conversion first.
     """
-    model_dir, output_dir = Path(model_dir), Path(output_dir)
+    model_dir = Path(model_dir)
     if not model_dir.is_dir():
         raise ValueError(f"Model directory does not exist: {model_dir}")
 
     llama_cpp = resolve_llama_cpp(llama_cpp_dir)
     quantize_bin = resolve_quantize_bin(llama_cpp) if quantize else None
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    preflight(model_dir, output_dir)
+    converted = Path(outfile.replace("{ftype}", outtype))
+    converted.parent.mkdir(parents=True, exist_ok=True)
+    preflight(model_dir, converted.parent)
 
-    name = name or model_dir.resolve().name
-    converted = output_dir / f"{name}-{outtype}.gguf"
     LOG.info("Converting %s to GGUF (%s)...", model_dir, outtype)
     _run(
         [
@@ -188,7 +188,7 @@ def export_gguf(
 
     outputs = [converted]
     for quant_type in quantize:
-        quantized = output_dir / f"{name}-{quant_type}.gguf"
+        quantized = Path(outfile.replace("{ftype}", quant_type))
         LOG.info("Quantizing to %s...", quant_type)
         _run([str(quantize_bin), str(converted), str(quantized), quant_type], quantized)
         outputs.append(quantized)

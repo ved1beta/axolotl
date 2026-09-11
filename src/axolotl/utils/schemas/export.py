@@ -26,16 +26,16 @@ class ExportConfig(BaseModel):
     format: Literal["gguf"] = Field(
         default="gguf", description="Deployment format to export to."
     )
-    outtype: Literal["f32", "f16", "bf16", "q8_0", "auto"] = Field(
-        default="f16", description="Weight type of the unquantized GGUF conversion."
+    outtype: Literal["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"] = Field(
+        default="f16", description="Weight type of the GGUF conversion."
     )
     quantize: list[str] = Field(
         default_factory=list,
         description="llama.cpp quant types to additionally emit, e.g. ['Q4_K_M', 'Q8_0'].",
     )
-    output_dir: str | None = Field(
+    outfile: str | None = Field(
         default=None,
-        description="Where to write exported files. Default: {output_dir}/gguf.",
+        description="Output path; `{ftype}` is replaced by each weight type. Default: {output_dir}/gguf/{run}-{ftype}.gguf",
     )
     llama_cpp_dir: str | None = Field(
         default=None,
@@ -49,7 +49,7 @@ class ExportConfig(BaseModel):
             return []
         if isinstance(quantize, str):
             quantize = quantize.split(",")
-        quant_types = [str(quant).strip().upper() for quant in quantize]
+        quant_types = list(dict.fromkeys(str(q).strip().upper() for q in quantize))
         if unknown := sorted(set(quant_types) - GGUF_QUANT_TYPES):
             raise ValueError(
                 f"Unknown GGUF quant type(s): {unknown}. "
@@ -58,13 +58,18 @@ class ExportConfig(BaseModel):
         return quant_types
 
     @model_validator(mode="after")
-    def validate_requantize(self):
-        # llama.cpp refuses to dequantize an already-quantized source, so a q8_0
-        # conversion cannot feed the quantize step.
-        if self.quantize and self.outtype == "q8_0":
+    def validate_quantize(self):
+        if not self.quantize:
+            return self
+        # llama.cpp refuses to dequantize an already-quantized source.
+        if self.outtype in ("q8_0", "tq1_0", "tq2_0"):
             raise ValueError(
-                "`export.outtype: q8_0` cannot be combined with `export.quantize` - "
-                "llama.cpp cannot requantize from q8_0. Use an f16/bf16/f32 outtype, "
-                "or drop `quantize` and use the q8_0 conversion directly."
+                f"llama.cpp cannot requantize from {self.outtype}. Use an f16/bf16/f32 "
+                "`export.outtype`, or drop `export.quantize`."
+            )
+        if self.outfile and "{ftype}" not in self.outfile:
+            raise ValueError(
+                "`export.outfile` needs a `{ftype}` placeholder when `export.quantize` "
+                "is set, e.g. `model-{ftype}.gguf`."
             )
         return self

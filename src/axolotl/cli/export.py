@@ -50,16 +50,18 @@ def do_export(config: Union[Path, str], cli_args: dict[str, Any]) -> list[Path]:
     export_cfg = ExportConfig(**{**(cfg.export or {}), **overrides})
 
     model_dir = resolve_model_dir(cfg, cli_args.get("model_dir"))
-    output_dir = Path(export_cfg.output_dir or Path(cfg.output_dir) / export_cfg.format)
+    run_dir = Path(cfg.output_dir)
+    outfile = export_cfg.outfile or str(
+        run_dir / export_cfg.format / f"{run_dir.name}-{{ftype}}.gguf"
+    )
 
     outputs = export_gguf(
         model_dir,
-        output_dir,
-        name=Path(cfg.output_dir).name,
+        outfile,
         outtype=export_cfg.outtype,
         quantize=export_cfg.quantize,
         llama_cpp_dir=export_cfg.llama_cpp_dir,
     )
-    LOG.info(f"Exported {len(outputs)} file(s) to {output_dir}.")
+    LOG.info(f"Exported {len(outputs)} file(s) to {Path(outfile).parent}.")
 
     return outputs

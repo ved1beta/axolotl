@@ -23,6 +23,7 @@ class TestExportConfig:
             ("q4_k_m", ["Q4_K_M"]),
             ("Q4_K_M, Q8_0", ["Q4_K_M", "Q8_0"]),
             (["q8_0", "BF16"], ["Q8_0", "BF16"]),
+            (["Q4_K_M", "q4_k_m", "Q8_0"], ["Q4_K_M", "Q8_0"]),
         ],
     )
     def test_quantize_normalization(self, quantize, expected):
@@ -39,9 +40,17 @@ class TestExportConfig:
         with pytest.raises(ValidationError):
             ExportConfig(**{field: value})
 
-    def test_q8_0_outtype_rejects_quantize(self):
-        with pytest.raises(ValidationError, match="cannot requantize from q8_0"):
-            ExportConfig(outtype="q8_0", quantize=["Q4_K_M"])
+    @pytest.mark.parametrize("outtype", ["q8_0", "tq1_0", "tq2_0"])
+    def test_quantized_outtype_rejects_quantize(self, outtype):
+        with pytest.raises(ValidationError, match=f"cannot requantize from {outtype}"):
+            ExportConfig(outtype=outtype, quantize=["Q4_K_M"])
+
+    def test_quantize_requires_ftype_placeholder_in_outfile(self):
+        with pytest.raises(ValidationError, match=r"needs a `\{ftype\}`"):
+            ExportConfig(outfile="model.gguf", quantize=["Q4_K_M"])
+
+    def test_untemplated_outfile_without_quantize(self):
+        assert ExportConfig(outfile="model.gguf").outfile == "model.gguf"
 
     @pytest.mark.parametrize("outtype", ["f16", "bf16", "f32", "auto"])
     def test_dequantizable_outtypes_allow_quantize(self, outtype):

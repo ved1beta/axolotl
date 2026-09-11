@@ -44,18 +44,20 @@ axolotl export config.yml
 
 ## Configuration
 
+Options are named after their `convert_hf_to_gguf.py` counterparts:
+
 ```yaml
 export:
   format: gguf         # Optional[str] = "gguf". Deployment format.
-  outtype: f16         # Optional[str] = "f16". Weight type of the unquantized conversion: f32, f16, bf16, q8_0, auto.
+  outtype: f16         # Optional[str] = "f16". Weight type of the conversion: f32, f16, bf16, q8_0, tq1_0, tq2_0, auto.
   quantize: [Q4_K_M]   # Optional[list[str]] = []. Additional llama.cpp quant types to emit.
-  output_dir:          # Optional[str]. Defaults to {output_dir}/gguf.
+  outfile:             # Optional[str]. Defaults to {output_dir}/gguf/{run}-{ftype}.gguf.
   llama_cpp_dir:       # Optional[str]. Defaults to $LLAMA_CPP_DIR.
 ```
 
-Every key can be overridden from the CLI (`--outtype`, `--quantize`, `--llama-cpp-dir`), and `--model-dir` exports an arbitrary checkpoint instead of the one in `output_dir`.
+Every key can be overridden from the CLI (`--outtype`, `--quantize`, `--outfile`, `--llama-cpp-dir`), and `--model-dir` exports an arbitrary checkpoint instead of the one in `output_dir`.
 
-Each requested quant type is written as its own file alongside the unquantized conversion:
+As in llama.cpp, `{ftype}` in `outfile` is replaced by the weight type, so each requested quant type is written as its own file alongside the unquantized conversion:
 
 ```
 outputs/my-run/gguf/

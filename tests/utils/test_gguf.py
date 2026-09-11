@@ -144,10 +144,12 @@ class TestExportGGUF:
     def test_convert_only(self, model_dir, llama_cpp_dir, tmp_path):
         with patch("axolotl.utils.gguf._run") as mock_run:
             outputs = export_gguf(
-                model_dir, tmp_path / "out", llama_cpp_dir=llama_cpp_dir
+                model_dir,
+                str(tmp_path / "out" / "model.gguf"),
+                llama_cpp_dir=llama_cpp_dir,
             )
 
-        assert outputs == [tmp_path / "out" / "merged-f16.gguf"]
+        assert outputs == [tmp_path / "out" / "model.gguf"]
         assert mock_run.call_count == 1
         cmd = mock_run.call_args.args[0]
         assert cmd[1] == str(llama_cpp_dir / "convert_hf_to_gguf.py")
@@ -163,8 +165,7 @@ class TestExportGGUF:
         with patch("axolotl.utils.gguf._run") as mock_run:
             outputs = export_gguf(
                 model_dir,
-                tmp_path / "out",
-                name="my-run",
+                str(tmp_path / "out" / "my-run-{ftype}.gguf"),
                 outtype="bf16",
                 quantize=["Q4_K_M", "Q8_0"],
                 llama_cpp_dir=llama_cpp_dir,
@@ -187,7 +188,9 @@ class TestExportGGUF:
     def test_missing_model_dir(self, llama_cpp_dir, tmp_path):
         with pytest.raises(ValueError, match="Model directory does not exist"):
             export_gguf(
-                tmp_path / "nope", tmp_path / "out", llama_cpp_dir=llama_cpp_dir
+                tmp_path / "nope",
+                str(tmp_path / "out.gguf"),
+                llama_cpp_dir=llama_cpp_dir,
             )
 
     def test_unbuilt_quantize_bin_fails_before_converting(
@@ -199,7 +202,7 @@ class TestExportGGUF:
                 with pytest.raises(ValueError, match="llama-quantize"):
                     export_gguf(
                         model_dir,
-                        tmp_path / "out",
+                        str(tmp_path / "{ftype}.gguf"),
                         quantize=["Q4_K_M"],
                         llama_cpp_dir=llama_cpp_dir,
                     )
@@ -210,7 +213,9 @@ class TestExportGGUF:
         _patch_config(model_dir, quantization_config={"quant_method": "torchao"})
         with patch("axolotl.utils.gguf._run") as mock_run:
             with pytest.raises(ValueError, match="pre-quantized"):
-                export_gguf(model_dir, tmp_path / "out", llama_cpp_dir=llama_cpp_dir)
+                export_gguf(
+                    model_dir, str(tmp_path / "out.gguf"), llama_cpp_dir=llama_cpp_dir
+                )
 
         mock_run.assert_not_called()
 
