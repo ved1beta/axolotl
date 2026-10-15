@@ -64,6 +64,18 @@ class AxolotlTrainingMixins:
             "help": "Whether to include tokens per second in the training metrics."
         },
     )
+    log_mfu: bool = field(
+        default=False,
+        metadata={"help": "Log model FLOPs utilization (requires include_tkps)."},
+    )
+    mfu_peak_flops: Optional[float] = field(
+        default=None,
+        metadata={"help": "Peak FLOP/s per GPU used as the MFU denominator."},
+    )
+    log_expert_load: bool = field(
+        default=False,
+        metadata={"help": "Log MoE expert load-balance stats."},
+    )
     eval_sample_packing: Optional[bool] = field(
         default=None,
         metadata={"help": "Use sample packing for efficient evals."},

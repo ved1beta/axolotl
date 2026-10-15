@@ -732,6 +732,10 @@ class TrainerBuilderBase(abc.ABC):
             "dataset_num_proc",
             # memory management
             "torch_empty_cache_steps",
+            # metrics
+            "log_mfu",
+            "mfu_peak_flops",
+            "log_expert_load",
         ]:
             if hasattr(self.cfg, arg) and getattr(self.cfg, arg) is not None:
                 training_args_kwargs[arg] = getattr(self.cfg, arg)

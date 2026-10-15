@@ -3197,6 +3197,24 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "bool of whether to report tokens per second per-gpu during training by measuring throughput of non-padding tokens.",
     ),
     (
+        ("--log-mfu/--no-log-mfu",),
+        None,
+        None,
+        "Log model FLOPs utilization (`mfu`) at each logging step, estimated as 6 * active non-embedding params per token (attention scores ignored) over the device's dense bf16 peak. Requires include_tkps.",
+    ),
+    (
+        ("--mfu-peak-flops",),
+        None,
+        None,
+        "Peak FLOP/s per GPU for MFU. Defaults to the dense bf16 peak for A100/H100/H200/B200/GB200; MFU is not logged on other devices unless this is set.",
+    ),
+    (
+        ("--log-expert-load/--no-log-expert-load",),
+        None,
+        None,
+        "Log MoE expert load-balance stats per logging step: mean and worst-layer max/mean tokens-per-expert ratio, and the mean coefficient of variation across experts.",
+    ),
+    (
         ("--neftune-noise-alpha",),
         None,
         None,

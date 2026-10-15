@@ -1373,6 +1373,24 @@ class AxolotlInputConfig(
             "description": "bool of whether to report tokens per second per-gpu during training by measuring throughput of non-padding tokens."
         },
     )
+    log_mfu: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Log model FLOPs utilization (`mfu`) at each logging step, estimated as 6 * active non-embedding params per token (attention scores ignored) over the device's dense bf16 peak. Requires include_tkps."
+        },
+    )
+    mfu_peak_flops: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Peak FLOP/s per GPU for MFU. Defaults to the dense bf16 peak for A100/H100/H200/B200/GB200; MFU is not logged on other devices unless this is set."
+        },
+    )
+    log_expert_load: bool | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Log MoE expert load-balance stats per logging step: mean and worst-layer max/mean tokens-per-expert ratio, and the mean coefficient of variation across experts."
+        },
+    )
     neftune_noise_alpha: float | None = Field(
         default=None,
         json_schema_extra={

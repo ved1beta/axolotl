@@ -30,6 +30,20 @@ logging_steps: 1
 ```
 :::
 
+### Throughput and MoE Routing Metrics
+
+Two opt-in metrics are computed on device and only synced at logging steps:
+
+```yaml
+log_mfu: true             # logs `mfu`; requires include_tkps (default true)
+mfu_peak_flops: 9.89e+14  # optional; auto-detected for A100/H100/H200/B200/GB200
+log_expert_load: true     # MoE only
+```
+
+`mfu` is model FLOPs utilization: 6 x active non-embedding params per processed token (MoE experts scaled by `top_k / num_experts`, attention scores ignored) times per-GPU tokens/sec, over the GPU's dense bf16 peak. It is an estimate and reads high for LoRA, whose frozen weights skip the weight-gradient matmuls.
+
+`log_expert_load` logs `moe/expert_load_max_over_mean` (busiest expert's token count over the per-layer mean, averaged across layers), `moe/expert_load_max_over_mean_worst_layer`, and `moe/expert_load_cv` (coefficient of variation of tokens per expert). A perfectly balanced router gives 1.0, 1.0 and 0.0; rising values mean routing collapse onto a few experts.
+
 ### Key Metrics for RL (GRPO)
 
 GRPO training logs a richer set of metrics. These are the critical ones:

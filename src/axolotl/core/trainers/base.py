@@ -52,9 +52,12 @@ from axolotl.core.trainers.mixins import (
     SchedulerMixin,
 )
 from axolotl.core.trainers.utils import (
+    ExpertLoadTracker,
+    peak_flops_per_gpu,
     sanitize_kwargs_for_ds_tagging,
     sanitize_kwargs_for_tagging,
     trainable_tokens_per_sec_per_gpu,
+    training_flops_per_token,
 )
 from axolotl.utils import get_not_null
 from axolotl.utils.bench import get_gpu_memory_usage
@@ -187,6 +190,23 @@ class AxolotlTrainer(
         self._tkps_total_acc: int = 0
         self._tkps_restored: tuple[int, int] = (0, 0)
         self._tkps_state: TrainerState | None = None
+        self._mfu_prev_total: float | None = None
+        self._mfu_flops_per_token: float | None = None
+        self._mfu_peak_flops = getattr(self.args, "mfu_peak_flops", None)
+        if getattr(self.args, "log_mfu", False):
+            if not self._mfu_peak_flops and torch.cuda.is_available():
+                self._mfu_peak_flops = peak_flops_per_gpu(torch.cuda.get_device_name())
+            if self._mfu_peak_flops:
+                self._mfu_flops_per_token = training_flops_per_token(unwrapped_model)
+            else:
+                LOG.warning(
+                    "log_mfu: unknown peak FLOP/s for this device, set mfu_peak_flops"
+                )
+        self._expert_load = (
+            ExpertLoadTracker(unwrapped_model)
+            if getattr(self.args, "log_expert_load", False)
+            else None
+        )
         self._stored_metrics = defaultdict(
             lambda: defaultdict(lambda: {"values": [], "reduction": "mean"})
         )
@@ -1134,11 +1154,29 @@ class AxolotlTrainer(
                 )
                 if rate is not None:
                     logs["tokens/train_per_sec_per_gpu"] = round(rate, 2)
+                if self._mfu_flops_per_token:
+                    # padding and prompt tokens cost FLOPs too, so MFU uses the total count
+                    curr_total = float(self.state.tokens["total"].item())
+                    total_rate = trainable_tokens_per_sec_per_gpu(
+                        self._mfu_prev_total, curr_total, get_world_size(), elapsed
+                    )
+                    if total_rate is not None:
+                        logs["mfu"] = round(
+                            total_rate
+                            * self._mfu_flops_per_token
+                            / self._mfu_peak_flops,
+                            4,
+                        )
+                    self._mfu_prev_total = curr_total
                 self._tkps_prev_trainable = curr_trainable
                 self._tkps_prev_time = now
                 logs["tokens/trainable"] = int(curr_trainable)
             if "total" in self.state.tokens:
                 logs["tokens/total"] = int(self.state.tokens["total"].item())
+
+        expert_load = getattr(self, "_expert_load", None)
+        if expert_load is not None and train_eval == "train":
+            logs.update(expert_load.stats())
 
         del self._stored_metrics[train_eval]
 
