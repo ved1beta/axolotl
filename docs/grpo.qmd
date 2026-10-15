@@ -226,6 +226,19 @@ def length_penalty(completions, **kwargs) -> list[float]:
     return rewards
 ```
 
+### Soft overlong penalty (DAPO)
+
+Set `overlong_penalty_cache` to add DAPO's soft overlong punishment as an extra reward. With `L_max = overlong_penalty_max_len` (defaults to `max_completion_length`) and `L_cache = overlong_penalty_cache`, completions up to `L_max - L_cache` tokens get 0, the penalty then falls linearly to -1 at `L_max`, and anything longer gets -1.
+
+```yaml
+trl:
+  max_completion_length: 4096
+  reward_funcs:
+    - rewards.accuracy_reward
+  overlong_penalty_cache: 512      # penalize completions longer than 3584 tokens
+  overlong_penalty_weight: 1.0     # appended after `reward_weights`
+```
+
 ### Multiple rewards and weighting
 
 You can combine multiple reward functions with different weights:
@@ -557,6 +570,9 @@ Available in TRL >= 1.8. Adds an entropy bonus to encourage exploration.
 |--------|------|---------|-------------|
 | `reward_funcs` | list[str] | `null` | Import paths to reward functions or HF model IDs |
 | `reward_weights` | list[float] | `null` | Relative weights for each reward function |
+| `overlong_penalty_cache` | int | `null` | Enables the DAPO soft overlong penalty with this buffer length |
+| `overlong_penalty_max_len` | int | `max_completion_length` | Length at which the overlong penalty reaches -1 |
+| `overlong_penalty_weight` | float | `1.0` | Reward weight for the overlong penalty |
 | `multi_objective_aggregation` | str | `null` | `"sum_then_normalize"` (GRPO) or `"normalize_then_sum"` (GDPO) |
 | `rollout_func` | str | `null` | Import path to custom rollout function for OpenEnv-style tasks |
 

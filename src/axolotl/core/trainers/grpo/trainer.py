@@ -443,6 +443,10 @@ class AxolotlGRPOContextParallelTrainer(AxolotlGRPOTrainer):
             is_eos.size(0), -1
         )
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        completion_ids_list = [
+            ids[mask.bool()].tolist()
+            for ids, mask in zip(completion_ids, completion_mask, strict=True)
+        ]
 
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.args.mask_truncated_completions:
@@ -556,13 +560,18 @@ class AxolotlGRPOContextParallelTrainer(AxolotlGRPOTrainer):
                 else:
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     keys = [
-                        key for key in inputs[0] if key not in ["prompt", "completion"]
+                        key
+                        for key in inputs[0]
+                        if key not in ["prompt", "completion", "completion_ids"]
                     ]
                     reward_kwargs = {
                         key: [example[key] for example in inputs] for key in keys
                     }
                     output_reward_func = reward_func(
-                        prompts=prompts, completions=completions, **reward_kwargs
+                        prompts=prompts,
+                        completions=completions,
+                        completion_ids=completion_ids_list,
+                        **reward_kwargs,
                     )
                     # Convert None values to NaN
                     output_reward_func = [

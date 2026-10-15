@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TRLConfig(BaseModel):
@@ -65,6 +65,23 @@ class TRLConfig(BaseModel):
         json_schema_extra={
             "description": "List of reward weights for the reward functions."
         },
+    )
+    overlong_penalty_cache: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Enables DAPO soft overlong punishment as an extra reward. Completions longer "
+            "than `overlong_penalty_max_len - overlong_penalty_cache` tokens are penalized linearly down to -1."
+        },
+    )
+    overlong_penalty_max_len: int | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Max completion length for the overlong penalty. Defaults to `max_completion_length`."
+        },
+    )
+    overlong_penalty_weight: float = Field(
+        default=1.0,
+        json_schema_extra={"description": "Reward weight for the overlong penalty."},
     )
     generation_batch_size: int | None = Field(
         default=None,
@@ -393,3 +410,19 @@ class TRLConfig(BaseModel):
             "Syncs only LoRA adapter weights vs full merged model."
         },
     )
+
+    @model_validator(mode="after")
+    def check_overlong_penalty(self):
+        if self.overlong_penalty_cache is None:
+            return self
+        if self.overlong_penalty_max_len is None:
+            self.overlong_penalty_max_len = self.max_completion_length
+        if self.overlong_penalty_max_len is None:
+            raise ValueError(
+                "`overlong_penalty_cache` requires `overlong_penalty_max_len` or `max_completion_length`"
+            )
+        if not 0 <= self.overlong_penalty_cache < self.overlong_penalty_max_len:
+            raise ValueError(
+                "`overlong_penalty_cache` must be >= 0 and < `overlong_penalty_max_len`"
+            )
+        return self

@@ -6,6 +6,8 @@ import pytest
 from huggingface_hub.errors import RepositoryNotFoundError
 
 from axolotl.core.trainers.grpo import GRPOStrategy
+from axolotl.utils.dict import DictDefault
+from axolotl.utils.schemas.trl import TRLConfig
 
 
 def test_get_rollout_func_loads_successfully():
@@ -42,3 +44,30 @@ def test_get_reward_func_unknown_offline_raises_error(monkeypatch):
     with pytest.raises(ValueError, match="Reward function .* not found") as excinfo:
         GRPOStrategy.get_reward_func("nonexistent_module.my_reward")
     assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
+
+
+def test_overlong_penalty_regions():
+    trl = TRLConfig(max_completion_length=100, overlong_penalty_cache=20)
+    (reward_funcs,) = GRPOStrategy.set_trainer_args(DictDefault(trl=trl.model_dump()))
+    assert len(reward_funcs) == 1
+    assert reward_funcs[0]([[1] * 80, [1] * 90, [1] * 120]) == [0.0, -0.5, -1.0]
+
+
+def test_overlong_penalty_appends_reward_weight():
+    trl = TRLConfig(
+        max_completion_length=100,
+        reward_funcs=["os.path.join"],
+        reward_weights=[2.0],
+        overlong_penalty_cache=20,
+        overlong_penalty_weight=0.5,
+    )
+    cfg = DictDefault(trl=trl.model_dump(), context_parallel_size=1)
+    assert len(GRPOStrategy.set_trainer_args(cfg)[0]) == 2
+    assert GRPOStrategy.set_training_args_kwargs(cfg)["reward_weights"] == [2.0, 0.5]
+
+
+def test_overlong_penalty_validation():
+    with pytest.raises(ValueError, match="overlong_penalty_cache"):
+        TRLConfig(max_completion_length=100, overlong_penalty_cache=100)
+    with pytest.raises(ValueError, match="max_completion_length"):
+        TRLConfig(overlong_penalty_cache=20)

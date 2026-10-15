@@ -8,6 +8,7 @@ from typing import Any
 
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from trl.rewards import get_soft_overlong_punishment
 from trl.trainer.grpo_trainer import RewardFunc
 
 from axolotl.core.trainers.grpo.args import AxolotlAsyncGRPOConfig, AxolotlGRPOConfig
@@ -140,6 +141,10 @@ class GRPOStrategy:
 
         if trl.reward_weights:
             grpo_args_kwargs["reward_weights"] = trl.reward_weights
+        if trl.overlong_penalty_cache is not None:
+            grpo_args_kwargs["reward_weights"] = (
+                trl.reward_weights or [1.0] * len(trl.reward_funcs or [])
+            ) + [trl.overlong_penalty_weight]
 
         if trl.scale_rewards is not None:
             grpo_args_kwargs["scale_rewards"] = trl.scale_rewards
@@ -263,10 +268,19 @@ class GRPOStrategy:
     @classmethod
     def set_trainer_args(cls, cfg: DictDefault) -> list[Any]:
         trainer_args = []
-        if cfg.trl and cfg.trl.reward_funcs:
+        if cfg.trl and (
+            cfg.trl.reward_funcs or cfg.trl.overlong_penalty_cache is not None
+        ):
             reward_funcs = []
-            for reward_func_fqn in cfg.trl.reward_funcs:
+            for reward_func_fqn in cfg.trl.reward_funcs or []:
                 reward_funcs.append(cls.get_reward_func(reward_func_fqn))
+            if cfg.trl.overlong_penalty_cache is not None:
+                reward_funcs.append(
+                    get_soft_overlong_punishment(
+                        cfg.trl.overlong_penalty_max_len,
+                        cfg.trl.overlong_penalty_cache,
+                    )
+                )
             trainer_args.append(reward_funcs)
 
         return trainer_args
