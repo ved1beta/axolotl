@@ -33,6 +33,8 @@ def my_reward(completions, **kwargs) -> list[float]:
 
 Multiple rewards: `reward_funcs: [r1, r2]` with `reward_weights: [1.0, 0.5]`.
 
+LLM-as-judge: add `axolotl.core.trainers.grpo.rewards.llm_judge_reward` to `reward_funcs` and set `trl.llm_judge` (`base_url`, `model`, optional `prompt_template`); see [grpo.qmd](../grpo.qmd#llm-judge-reward).
+
 Image datasets (`images`/`image` column, `processor_type: AutoProcessor`) also work; rewards receive the loaded images as the `images` kwarg (one list per sample, for either column). See [rlhf.qmd](../rlhf.qmd#multimodal).
 
 ## Key Async Features

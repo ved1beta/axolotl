@@ -4,6 +4,7 @@ import importlib
 import inspect
 import os
 import warnings
+from functools import partial
 from typing import Any
 
 from huggingface_hub import snapshot_download
@@ -19,7 +20,7 @@ from axolotl.core.trainers.grpo.trainer import (
 )
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.logging import get_logger
-from axolotl.utils.schemas.trl import TRLConfig
+from axolotl.utils.schemas.trl import LLM_JUDGE_REWARD, TRLConfig
 from axolotl.utils.schemas.vllm import VllmConfig
 
 LOG = get_logger(__name__)
@@ -266,7 +267,13 @@ class GRPOStrategy:
         if cfg.trl and cfg.trl.reward_funcs:
             reward_funcs = []
             for reward_func_fqn in cfg.trl.reward_funcs:
-                reward_funcs.append(cls.get_reward_func(reward_func_fqn))
+                reward_func = cls.get_reward_func(reward_func_fqn)
+                if reward_func_fqn == LLM_JUDGE_REWARD:
+                    judge_kwargs = {
+                        k: v for k, v in cfg.trl.llm_judge.items() if v is not None
+                    }
+                    reward_func = partial(reward_func, **judge_kwargs)
+                reward_funcs.append(reward_func)
             trainer_args.append(reward_funcs)
 
         return trainer_args

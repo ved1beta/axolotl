@@ -1369,6 +1369,12 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "List of reward weights for the reward functions.",
     ),
     (
+        ("--trl.llm-judge",),
+        "trl__llm_judge",
+        None,
+        "Judge settings, required when `axolotl.core.trainers.grpo.rewards.llm_judge_reward` is in reward_funcs.",
+    ),
+    (
         ("--trl.generation-batch-size",),
         "trl__generation_batch_size",
         "int",

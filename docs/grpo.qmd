@@ -291,6 +291,29 @@ trl:
     - 0.3
 ```
 
+### LLM judge reward
+
+The built-in `llm_judge_reward` scores each completion with any OpenAI-compatible chat endpoint (a separate vLLM server, or a hosted API). The judge must end its reply with `Score: <number>`; the score is divided by `max_score` and clamped to [0, 1]. Failed requests or unparsable replies score 0 with a warning.
+
+```yaml
+trl:
+  reward_funcs:
+    - axolotl.core.trainers.grpo.rewards.llm_judge_reward
+  llm_judge:
+    base_url: http://localhost:8001/v1   # not the policy's vLLM server
+    model: Qwen/Qwen3-8B
+    # api_key defaults to $OPENAI_API_KEY
+    # optional; placeholders: {prompt}, {completion}, and any kept dataset column
+    prompt_template: |
+      Reference answer: {answer}
+      Question: {prompt}
+      Response: {completion}
+      Rate the response's correctness from 0 to 10. End with "Score: <number>".
+    max_score: 10
+    max_concurrency: 8
+    timeout: 60
+```
+
 ### Using math_verify
 
 The `math_verify` library provides robust mathematical answer verification but uses `signal.alarm()` internally, which only works in the main thread. If you use `math_verify` in a reward function, set `reward_num_workers` to use subprocess workers:

@@ -2,7 +2,47 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+LLM_JUDGE_REWARD = "axolotl.core.trainers.grpo.rewards.llm_judge_reward"
+
+
+class LLMJudgeConfig(BaseModel):
+    """Settings for the built-in LLM-judge GRPO reward."""
+
+    base_url: str = Field(
+        json_schema_extra={
+            "description": "Base URL of an OpenAI-compatible API, e.g. http://localhost:8001/v1"
+        },
+    )
+    model: str = Field(json_schema_extra={"description": "Judge model name."})
+    prompt_template: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Judge prompt with {prompt}, {completion} and any dataset column placeholders. "
+            "Must ask for a final `Score: <number>` line."
+        },
+    )
+    api_key: str | None = Field(
+        default=None,
+        json_schema_extra={"description": "API key. Defaults to $OPENAI_API_KEY."},
+    )
+    max_score: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Top of the judge's score scale; scores are divided by it and clamped to [0, 1]. Default 10."
+        },
+    )
+    max_concurrency: int | None = Field(
+        default=None,
+        json_schema_extra={"description": "Max parallel judge requests. Default 8."},
+    )
+    timeout: float | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Per-request timeout in seconds. Default 60."
+        },
+    )
 
 
 class TRLConfig(BaseModel):
@@ -64,6 +104,12 @@ class TRLConfig(BaseModel):
         default=None,
         json_schema_extra={
             "description": "List of reward weights for the reward functions."
+        },
+    )
+    llm_judge: LLMJudgeConfig | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": f"Judge settings, required when `{LLM_JUDGE_REWARD}` is in reward_funcs."
         },
     )
     generation_batch_size: int | None = Field(
@@ -393,3 +439,9 @@ class TRLConfig(BaseModel):
             "Syncs only LoRA adapter weights vs full merged model."
         },
     )
+
+    @model_validator(mode="after")
+    def check_llm_judge(self):
+        if LLM_JUDGE_REWARD in (self.reward_funcs or []) and self.llm_judge is None:
+            raise ValueError(f"trl.llm_judge must be set to use {LLM_JUDGE_REWARD}")
+        return self
